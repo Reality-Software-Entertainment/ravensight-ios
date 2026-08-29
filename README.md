@@ -10,9 +10,9 @@ side kill switch, in one Swift package and no third party dependencies.
 * iOS 15 or newer, macOS 12 or newer
 * Swift Package Manager only, URLSession transport, zero dependencies
 
-## BETA notice
+## Verification status
 
-This package is a beta. The protocol logic in `Sources/Ravensight/Core` is
+The protocol logic in `Sources/Ravensight/Core` is
 written and reviewed against the live API contract, and it is deliberately
 free of any URLSession dependency so it can be tested on its own. It has
 **not** yet been verified inside a shipping app.
