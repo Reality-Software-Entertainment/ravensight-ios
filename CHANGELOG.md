@@ -2,6 +2,69 @@
 
 All notable changes to this package are documented here.
 
+## [0.2.0] - 2026-10-10
+
+### Breaking
+
+* `game_paused` and `game_resumed` are no longer sent by default. Set
+  `trackPauseEvents = true` to keep them. On macOS a focus change sends
+  nothing by default.
+* `Ravensight.setEnabled(_:)` is deprecated in favour of
+  `Ravensight.setTrackingEnabled(_:)`, which saves the player's choice. The
+  old call still works as an unsaved runtime switch.
+* `start()` makes no request while the SDK is disabled or the player has
+  opted out, and an iOS launch into the background waits for the first
+  foreground before `game_started`, the settings check and the session.
+* `track()` no longer sends a request per call: the queue goes out on the
+  flush timer, at 50 queued, on `flush()`, on background and on quit.
+* The default `apiUrl` is the bare host `https://api.ravensight.io`; the SDK
+  appends `/api/v1` and strips a trailing one.
+* A `401`, or a `403` other than `tracking_disabled` or a playtest refusal,
+  now stops automatic sending for the run (`invalid_key`) instead of being
+  retried forever; a settings `401` no longer means "assume tracking on".
+* Feedback with a category outside `feedbackCategories` or a rating outside
+  1 to 5 fails locally (`invalid_category`, `invalid_rating`), and feedback
+  while tracking is off fails with `disabled` (was `tracking_disabled`).
+* The package now ships a `PrivacyInfo.xcprivacy` resource.
+
+### Added
+
+* `RavensightConfiguration.enabled` (default true, never saved),
+  `trackPauseEvents`, `sessionTimeout` (1800 seconds), `playtestToken` and
+  `playtestRunId`.
+* `setTrackingEnabled(_:)`, saved in `UserDefaults` before it returns and
+  callable before `start()`; `isOptedOut`; `resetDeviceId()`, which returns
+  the new id. On the client and the facade.
+* The iOS session rule: a marker on background, `game_exited` stamped at
+  the background time after `sessionTimeout` and a new session, the cold
+  launch marker reported once for an app swiped away in the background.
+* `statusReason` and `onStatusChange` with the reasons `disabled`,
+  `invalid_key`, `tracking_disabled`, `offline`, `rate_limited`,
+  `session_failed` and `playtest_job_closed`.
+* Ravensight Playtest support: token and run id from the configuration or
+  the launch environment, `pt-<runId>` device id in memory only, the
+  `X-Ravensight-Playtest` header on every request, `isPlaytest`.
+* Public `sessionToken` for handing the session to a game server, and
+  `feedbackCategories` and `sdkVersion`.
+* `PrivacyInfo.xcprivacy`: `UserDefaults` with reason `CA92.1`, Device ID and
+  Product Interaction (not linked, not tracking, Analytics), no tracking.
+* Client tests over a fake transport, clock and storage for every opt-out
+  order, reset, key refusal, the kill switch, batching, feedback, the 30
+  minute rule, the cold launch marker, background launches and playtest.
+
+### Fixed
+
+* `Ravensight.setEnabled(false)` called before `start()` was silently
+  ignored, so a player who opted out was still tracked.
+* `game_exited` was only sent on `willTerminate`, which iOS rarely delivers,
+  and a session survived any length of time in the background.
+* A `403 tracking_disabled` from the session or batch endpoint is now the
+  kill switch instead of a retry.
+* `Retry-After` is honoured on `503` as well as `429`.
+* A batch `401` re-opens the session twice in a row before backing off.
+* Fetching suggestions while tracking is off no longer makes a request.
+* New device ids take 16 bytes from the system's secure random generator.
+
 ## [0.1.0] - 2026-08-29
 
 First public beta.
