@@ -5,21 +5,27 @@ import UIKit
 import AppKit
 #endif
 
-/// Hooks the app lifecycle so queued events are flushed when the player
-/// leaves: on resign active, on entering the background and on termination.
-/// On iOS the background flush runs under a UIApplication background task
-/// assertion; on macOS the terminate flush runs under a ProcessInfo activity
-/// that disables sudden termination. Both are best effort: a process that
-/// exits immediately can still lose the last batch, since the queue lives in
-/// memory only.
+/// Wires the app lifecycle notifications to the client's handlers. The
+/// handlers themselves live on RavensightClient (handleDidEnterBackground,
+/// handleWillEnterForeground and so on) so tests call them directly, with no
+/// UIKit or AppKit notification involved.
+///
+/// iOS: resign active flushes; entering the background flushes under a
+/// UIApplication background task and saves the session marker; returning
+/// after sessionTimeout ends the old session with game_exited (stamped when
+/// the player left) and opens a new one; termination sends game_exited and
+/// holds the quit for at most 1.5 seconds. A launch into the background
+/// starts the SDK at the first didBecomeActive.
+///
+/// macOS: focus changes are not exits and send nothing (game_paused and
+/// game_resumed only with trackPauseEvents); termination sends game_exited
+/// and holds the quit for at most 1.5 seconds.
 final class RavensightLifecycle {
     private weak var client: RavensightClient?
-    private let trackEvents: Bool
     private var observers: [NSObjectProtocol] = []
 
-    init(client: RavensightClient, trackEvents: Bool) {
+    init(client: RavensightClient) {
         self.client = client
-        self.trackEvents = trackEvents
         installObservers()
     }
 
@@ -38,71 +44,59 @@ final class RavensightLifecycle {
 
     private func installObservers() {
         #if canImport(UIKit) && !os(watchOS)
+        observe(UIApplication.didBecomeActiveNotification) { [weak self] in
+            self?.client?.handleDidBecomeActive()
+        }
         observe(UIApplication.willResignActiveNotification) { [weak self] in
-            self?.client?.flush()
+            self?.client?.handleWillResignActive()
         }
         observe(UIApplication.didEnterBackgroundNotification) { [weak self] in
-            guard let self = self else { return }
-            if self.trackEvents { self.client?.track("game_paused") }
-            self.flushWithBackgroundAssertion()
+            self?.enterBackgroundWithAssertion()
         }
         observe(UIApplication.willEnterForegroundNotification) { [weak self] in
-            guard let self = self else { return }
-            if self.trackEvents { self.client?.track("game_resumed") }
+            self?.client?.handleWillEnterForeground()
         }
         observe(UIApplication.willTerminateNotification) { [weak self] in
-            guard let self = self else { return }
-            if self.trackEvents { self.client?.track("game_exited") }
-            self.flushWithBackgroundAssertion()
+            self?.client?.handleWillTerminate()
         }
         #elseif canImport(AppKit)
         observe(NSApplication.didResignActiveNotification) { [weak self] in
-            guard let self = self else { return }
-            if self.trackEvents { self.client?.track("game_paused") }
-            self.client?.flush()
+            self?.client?.handleFocusLost()
         }
         observe(NSApplication.didBecomeActiveNotification) { [weak self] in
-            guard let self = self else { return }
-            if self.trackEvents { self.client?.track("game_resumed") }
+            self?.client?.handleFocusGained()
         }
         observe(NSApplication.willTerminateNotification) { [weak self] in
-            guard let self = self else { return }
-            if self.trackEvents { self.client?.track("game_exited") }
-            self.flushWithProcessActivity()
+            self?.client?.handleWillTerminate()
         }
         #endif
     }
 
     #if canImport(UIKit) && !os(watchOS)
-    /// Runs a flush under a background task assertion so iOS grants the app a
-    /// short window to finish the request after the player leaves.
-    private func flushWithBackgroundAssertion() {
+    /// Runs the background handler's flush under a background task assertion
+    /// so iOS grants the app a short window to finish the request after the
+    /// player leaves.
+    private func enterBackgroundWithAssertion() {
+        guard let client = client else { return }
         let application = UIApplication.shared
+        let lock = NSLock()
         var taskId = UIBackgroundTaskIdentifier.invalid
         let end = {
-            if taskId != .invalid {
-                application.endBackgroundTask(taskId)
-                taskId = .invalid
+            lock.lock()
+            let id = taskId
+            taskId = .invalid
+            lock.unlock()
+            if id != .invalid {
+                DispatchQueue.main.async { application.endBackgroundTask(id) }
             }
         }
-        taskId = application.beginBackgroundTask(withName: "io.ravensight.flush") {
+        let begun = application.beginBackgroundTask(withName: "io.ravensight.flush") {
             end()
         }
-        client?.flush {
-            end()
-        }
-    }
-    #elseif canImport(AppKit)
-    /// Runs a flush under a ProcessInfo activity so sudden termination is
-    /// deferred while the last batch leaves.
-    private func flushWithProcessActivity() {
-        let activity = ProcessInfo.processInfo.beginActivity(
-            options: [.suddenTerminationDisabled, .idleSystemSleepDisabled],
-            reason: "Ravensight final flush"
-        )
-        client?.flush {
-            ProcessInfo.processInfo.endActivity(activity)
-        }
+        lock.lock()
+        taskId = begun
+        lock.unlock()
+        client.handleDidEnterBackground(completion: end)
     }
     #endif
 }

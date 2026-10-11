@@ -307,6 +307,9 @@ final class RavensightCoreTests: XCTestCase {
         expectBatch(&core, count: 1, respond: 401)
         openSession(&core, token: "sess_2")
         expectBatch(&core, count: 1, respond: 401)
+        // Two re opens in a row are allowed; the third 401 backs off.
+        openSession(&core, token: "sess_3")
+        expectBatch(&core, count: 1, respond: 401)
 
         guard case .wait = core.nextStep(nowMs: nowMs) else {
             return XCTFail("expected a backoff wait after repeated 401s")
@@ -508,6 +511,19 @@ final class RavensightCoreTests: XCTestCase {
             RavensightCore.normalizeApiUrl(""),
             "https://api.ravensight.io/api/v1"
         )
+        XCTAssertEqual(
+            RavensightCore.normalizeApiUrl("  https://self.example.com/api/v1//  "),
+            "https://self.example.com/api/v1"
+        )
+        XCTAssertEqual(
+            RavensightCore.normalizeApiUrl("https://self.example.com///"),
+            "https://self.example.com/api/v1"
+        )
+        XCTAssertEqual(
+            RavensightCore.normalizeApiUrl("   "),
+            "https://api.ravensight.io/api/v1"
+        )
+        XCTAssertEqual(RavensightClient.defaultApiUrl, "https://api.ravensight.io", "the default is the bare host")
     }
 
     func testRetryAfterParsing() {
@@ -575,5 +591,264 @@ final class RavensightCoreTests: XCTestCase {
         XCTAssertEqual(request.method, "GET")
         XCTAssertTrue(request.url.hasSuffix("/api/v1/agent/suggestions"))
         XCTAssertEqual(request.headers["X-API-Key"], "gt_live_test_key")
+    }
+
+    // MARK: 0.2.0 contract
+
+    private func makePlaytestCore() -> RavensightCore {
+        return RavensightCore(config: RavensightCoreConfig(
+            ingestKey: "gt_live_test_key",
+            apiUrl: "https://api.example.com",
+            deviceId: "pt-run_1",
+            playtestToken: "pt_token"
+        ))
+    }
+
+    private func forbidden(_ code: String) -> RavensightResponse {
+        return RavensightResponse(status: 403, body: jsonBody(["error": code]))
+    }
+
+    func testSettingsUnauthorizedRefusesKeyAndStopsAutomaticSending() {
+        var core = makeCore()
+        core.track(name: "queued", data: nil, nowMs: nowMs)
+        guard case .send(_, .settings) = core.nextStep(nowMs: nowMs) else {
+            return XCTFail("expected settings check")
+        }
+        let effects = core.handle(response: RavensightResponse(status: 401), for: .settings, nowMs: nowMs)
+        XCTAssertEqual(effects, [.keyRefused])
+        XCTAssertEqual(core.statusReason, "invalid_key")
+        XCTAssertEqual(core.nextStep(nowMs: nowMs), .idle, "no automatic retry after a refused key")
+        XCTAssertEqual(core.nextStep(nowMs: nowMs + 3_600_000), .idle)
+        XCTAssertEqual(core.pendingEvents.count, 1, "the queue is kept")
+        XCTAssertTrue(core.track(name: "still_queues", data: nil, nowMs: nowMs))
+
+        // An explicit flush makes one more attempt.
+        guard case .send(_, .session) = core.nextStep(nowMs: nowMs, ignoringBackoff: true) else {
+            return XCTFail("expected one more attempt on an explicit flush")
+        }
+    }
+
+    func testSessionUnauthorizedAndUnknownForbiddenAreInvalidKey() {
+        for response in [RavensightResponse(status: 401), forbidden("forbidden"), RavensightResponse(status: 403)] {
+            var core = makeCore()
+            boot(&core)
+            core.track(name: "e", data: nil, nowMs: nowMs)
+            guard case .send(_, .session) = core.nextStep(nowMs: nowMs) else {
+                return XCTFail("expected a session request")
+            }
+            XCTAssertEqual(core.handle(response: response, for: .session, nowMs: nowMs), [.keyRefused])
+            XCTAssertEqual(core.statusReason, "invalid_key")
+            XCTAssertEqual(core.nextStep(nowMs: nowMs + 600_000), .idle)
+        }
+    }
+
+    func testSessionForbiddenTrackingDisabledIsTheKillSwitch() {
+        var core = makeCore()
+        boot(&core)
+        core.track(name: "e", data: nil, nowMs: nowMs)
+        guard case .send(_, .session) = core.nextStep(nowMs: nowMs) else {
+            return XCTFail("expected a session request")
+        }
+        let effects = core.handle(response: forbidden("tracking_disabled"), for: .session, nowMs: nowMs)
+        XCTAssertEqual(effects, [.trackingDisabled])
+        XCTAssertFalse(core.trackingEnabled)
+        XCTAssertTrue(core.pendingEvents.isEmpty)
+        XCTAssertEqual(core.statusReason, "tracking_disabled")
+        XCTAssertEqual(core.nextStep(nowMs: nowMs, ignoringBackoff: true), .idle)
+        XCTAssertFalse(core.track(name: "ignored", data: nil, nowMs: nowMs))
+    }
+
+    func testBatchForbiddenTrackingDisabledIsTheKillSwitch() {
+        var core = makeCore()
+        boot(&core)
+        core.track(name: "e", data: nil, nowMs: nowMs)
+        openSession(&core)
+        let (_, effects) = expectBatch(&core, count: 1, respond: 403, body: jsonBody(["error": "tracking_disabled"]))
+        XCTAssertEqual(effects, [.trackingDisabled])
+        XCTAssertTrue(core.pendingEvents.isEmpty)
+    }
+
+    func testServiceUnavailableHonoursRetryAfter() {
+        var core = makeCore()
+        boot(&core)
+        core.track(name: "e", data: nil, nowMs: nowMs)
+        guard case .send(_, .session) = core.nextStep(nowMs: nowMs) else {
+            return XCTFail("expected a session request")
+        }
+        _ = core.handle(
+            response: RavensightResponse(status: 503, body: jsonBody(["error": "storage_unavailable"]), retryAfter: "60"),
+            for: .session, nowMs: nowMs
+        )
+        XCTAssertEqual(core.nextStep(nowMs: nowMs), .wait(untilMs: nowMs + 60_000))
+
+        nowMs += 60_000
+        openSession(&core)
+        expectBatch(&core, count: 1, respond: 503, retryAfter: "60")
+        XCTAssertEqual(core.nextStep(nowMs: nowMs), .wait(untilMs: nowMs + 60_000))
+        XCTAssertEqual(core.pendingEvents.count, 1)
+    }
+
+    func testRateLimitReasonAndOfflineReason() {
+        var core = makeCore()
+        boot(&core)
+        core.track(name: "e", data: nil, nowMs: nowMs)
+        guard case .send(_, .session) = core.nextStep(nowMs: nowMs) else {
+            return XCTFail("expected a session request")
+        }
+        _ = core.handle(response: RavensightResponse(status: 429, retryAfter: "7"), for: .session, nowMs: nowMs)
+        XCTAssertEqual(core.statusReason, "rate_limited")
+        XCTAssertEqual(core.nextStep(nowMs: nowMs), .wait(untilMs: nowMs + 7_000))
+
+        nowMs += 7_000
+        guard case .send(_, .session) = core.nextStep(nowMs: nowMs) else {
+            return XCTFail("expected a session request")
+        }
+        _ = core.handle(response: .networkFailure("down"), for: .session, nowMs: nowMs)
+        XCTAssertEqual(core.statusReason, "offline")
+
+        nowMs += 10_000
+        openSession(&core)
+        XCTAssertNil(core.statusReason, "a session clears the reason")
+    }
+
+    func testOptedOutOrDisabledCoreRequestsNothing() {
+        var core = makeCore()
+        core.setOptedOut(true)
+        XCTAssertEqual(core.nextStep(nowMs: nowMs), .idle, "not even the settings check")
+        XCTAssertEqual(core.nextStep(nowMs: nowMs, ignoringBackoff: true), .idle)
+        XCTAssertFalse(core.track(name: "e", data: nil, nowMs: nowMs))
+        XCTAssertEqual(core.statusReason, "disabled")
+
+        var disabled = makeCore()
+        disabled.setEnabled(false)
+        XCTAssertEqual(disabled.nextStep(nowMs: nowMs, ignoringBackoff: true), .idle)
+        XCTAssertEqual(disabled.statusReason, "disabled")
+    }
+
+    func testTrackTakesAnExplicitTimestamp() {
+        var core = makeCore()
+        core.track(name: "late", data: nil, nowMs: nowMs, atSec: 123)
+        XCTAssertEqual(core.pendingEvents.first?.timestamp, 123)
+    }
+
+    func testReplaceDeviceIdClearsQueueAndSession() {
+        var core = makeCore()
+        boot(&core)
+        core.track(name: "e", data: nil, nowMs: nowMs)
+        openSession(&core)
+        core.replaceDeviceId("dev_new")
+        XCTAssertTrue(core.pendingEvents.isEmpty)
+        XCTAssertNil(core.sessionToken)
+        core.track(name: "f", data: nil, nowMs: nowMs)
+        guard case .send(let request, .session) = core.nextStep(nowMs: nowMs) else {
+            return XCTFail("expected a fresh session")
+        }
+        XCTAssertEqual(decode(request.body)["deviceId"] as? String, "dev_new")
+    }
+
+    // MARK: Background exit
+
+    func testPendingExitGoesFirstUnderTheOldTokenWithItsOwnTimestamp() {
+        var core = makeCore()
+        core.track(name: "game_started", data: nil, nowMs: nowMs)
+        core.setPendingExit(.init(sessionToken: "sess_old", timestamp: 4_242, retry: false))
+
+        guard case .send(let request, .exit(retry: false)) = core.nextStep(nowMs: nowMs) else {
+            return XCTFail("the exit goes before anything else, even the settings check")
+        }
+        XCTAssertTrue(request.url.hasSuffix("/api/v1/track/batch"))
+        XCTAssertEqual(request.headers["X-Session-Token"], "sess_old")
+        let events = decode(request.body)["events"] as? [[String: Any]]
+        XCTAssertEqual(events?.count, 1)
+        XCTAssertEqual(events?.first?["event"] as? String, "game_exited")
+        XCTAssertEqual((events?.first?["timestamp"] as? NSNumber)?.int64Value, 4_242)
+
+        // One attempt, whatever the answer.
+        _ = core.handle(response: .networkFailure("down"), for: .exit(retry: false), nowMs: nowMs)
+        XCTAssertNil(core.pendingExit)
+        guard case .send(_, .settings) = core.nextStep(nowMs: nowMs) else {
+            return XCTFail("then the ordinary boot")
+        }
+    }
+
+    func testRetryingExitSurvivesAnOutage() {
+        var core = makeCore()
+        boot(&core)
+        core.setPendingExit(.init(sessionToken: "sess_old", timestamp: 1, retry: true))
+        _ = core.handle(response: .networkFailure("down"), for: .exit(retry: true), nowMs: nowMs)
+        XCTAssertNotNil(core.pendingExit)
+        guard case .wait = core.nextStep(nowMs: nowMs) else { return XCTFail("expected backoff") }
+        nowMs += 10_000
+        guard case .send(_, .exit(retry: true)) = core.nextStep(nowMs: nowMs) else {
+            return XCTFail("expected the exit again")
+        }
+        _ = core.handle(response: RavensightResponse(status: 202), for: .exit(retry: true), nowMs: nowMs)
+        XCTAssertNil(core.pendingExit)
+    }
+
+    func testOptedOutCoreDropsPendingExit() {
+        var core = makeCore()
+        core.setOptedOut(true)
+        core.setPendingExit(.init(sessionToken: "sess_old", timestamp: 1, retry: false))
+        XCTAssertNil(core.pendingExit)
+    }
+
+    // MARK: Playtest
+
+    func testPlaytestHeaderOnEveryRequest() {
+        var core = makePlaytestCore()
+        core.track(name: "e", data: nil, nowMs: nowMs)
+        var seen: [RavensightRequest] = []
+        guard case .send(let settings, .settings) = core.nextStep(nowMs: nowMs) else { return XCTFail("settings") }
+        seen.append(settings)
+        _ = core.handle(response: RavensightResponse(status: 200, body: jsonBody(["trackingEnabled": true])), for: .settings, nowMs: nowMs)
+        guard case .send(let session, .session) = core.nextStep(nowMs: nowMs) else { return XCTFail("session") }
+        seen.append(session)
+        XCTAssertEqual(decode(session.body)["deviceId"] as? String, "pt-run_1")
+        _ = core.handle(response: RavensightResponse(status: 201, body: jsonBody(["token": "s", "expiresIn": 3600])), for: .session, nowMs: nowMs)
+        guard case .send(let batch, .batch) = core.nextStep(nowMs: nowMs) else { return XCTFail("batch") }
+        seen.append(batch)
+        seen.append(core.feedbackRequest(message: "m", category: nil, rating: 0, token: "s"))
+        seen.append(core.suggestionsRequest())
+        for request in seen {
+            XCTAssertEqual(request.headers["X-Ravensight-Playtest"], "pt_token", request.url)
+        }
+        XCTAssertNil(makeCore().suggestionsRequest().headers["X-Ravensight-Playtest"])
+    }
+
+    func testPlaytestJobClosedStopsTheRun() {
+        var core = makePlaytestCore()
+        boot(&core)
+        core.track(name: "e", data: nil, nowMs: nowMs)
+        guard case .send(_, .session) = core.nextStep(nowMs: nowMs) else { return XCTFail("session") }
+        let effects = core.handle(response: forbidden("playtest_job_closed"), for: .session, nowMs: nowMs)
+        XCTAssertEqual(effects, [.stopped("playtest_job_closed")])
+        XCTAssertEqual(core.statusReason, "playtest_job_closed")
+        XCTAssertTrue(core.pendingEvents.isEmpty)
+        XCTAssertEqual(core.nextStep(nowMs: nowMs, ignoringBackoff: true), .idle)
+        XCTAssertFalse(core.track(name: "f", data: nil, nowMs: nowMs))
+    }
+
+    func testInvalidPlaytestTokenStopsWithSessionFailed() {
+        var core = makePlaytestCore()
+        guard case .send(_, .settings) = core.nextStep(nowMs: nowMs) else { return XCTFail("settings") }
+        let effects = core.handle(response: forbidden("invalid_playtest_token"), for: .settings, nowMs: nowMs)
+        XCTAssertEqual(effects, [.stopped("session_failed")])
+        XCTAssertEqual(core.statusReason, "session_failed")
+        XCTAssertEqual(core.nextStep(nowMs: nowMs, ignoringBackoff: true), .idle)
+    }
+
+    // MARK: Feedback validation
+
+    func testFeedbackRefusals() {
+        XCTAssertEqual(RavensightCore.feedbackCategories, ["bug", "suggestion", "complaint", "praise", "playtest", "other"])
+        XCTAssertNil(RavensightCore.feedbackRefusal(message: "ok", category: nil, rating: 0))
+        XCTAssertNil(RavensightCore.feedbackRefusal(message: "ok", category: "", rating: 5))
+        XCTAssertNil(RavensightCore.feedbackRefusal(message: "ok", category: "suggestion", rating: 1))
+        XCTAssertEqual(RavensightCore.feedbackRefusal(message: "  ", category: nil, rating: 0), "empty_message")
+        XCTAssertEqual(RavensightCore.feedbackRefusal(message: "ok", category: "balance", rating: 0), "invalid_category")
+        XCTAssertEqual(RavensightCore.feedbackRefusal(message: "ok", category: "Bug", rating: 0), "invalid_category")
+        XCTAssertEqual(RavensightCore.feedbackRefusal(message: "ok", category: nil, rating: 6), "invalid_rating")
+        XCTAssertEqual(RavensightCore.feedbackRefusal(message: "ok", category: nil, rating: -1), "invalid_rating")
     }
 }

@@ -67,7 +67,8 @@ public enum Ravensight {
         client.flush(completion: completion)
     }
 
-    /// Posts player feedback. The rating is 1 to 5, or 0 to omit it.
+    /// Posts player feedback. The category is one of feedbackCategories;
+    /// the rating is 1 to 5, or 0 to omit it.
     public static func submitFeedback(
         _ message: String,
         category: String? = nil,
@@ -88,7 +89,8 @@ public enum Ravensight {
         client.submitFeedback(message, category: category, rating: rating, completion: completion)
     }
 
-    /// EXPERIMENTAL. AI generated design suggestions for your game.
+    /// EXPERIMENTAL. AI generated design suggestions for your game. An
+    /// empty list while tracking is off.
     public static func fetchSuggestions(_ completion: @escaping (Result<[[String: Any]], RavensightError>) -> Void) {
         guard let client = shared else {
             DispatchQueue.main.async {
@@ -102,14 +104,78 @@ public enum Ravensight {
         client.fetchSuggestions(completion)
     }
 
-    /// Local opt in and opt out for a privacy toggle. Disabling discards
-    /// anything still queued.
+    /// The player's choice, for a privacy toggle. Saved to UserDefaults
+    /// before this returns, and safe to call before start(): the client
+    /// reads it when it is created, and a saved opt-out wins over
+    /// configuration.enabled. Turning off clears the queue and stops sending.
+    public static func setTrackingEnabled(_ enabled: Bool) {
+        if let client = shared {
+            client.setTrackingEnabled(enabled)
+        } else if launchedForPlaytest {
+            print("Ravensight: setTrackingEnabled is ignored during a playtest run")
+        } else {
+            RavensightClient.saveTrackingEnabled(enabled, defaults: .standard)
+        }
+    }
+
+    /// True when the player opted out with setTrackingEnabled(false). Reads
+    /// the saved choice when the SDK has not been started.
+    public static var isOptedOut: Bool {
+        if let client = shared { return client.isOptedOut }
+        return UserDefaults.standard.bool(forKey: RavensightClient.optOutKey)
+    }
+
+    /// Forgets this install's analytics identity and returns the new device
+    /// id. See RavensightClient.resetDeviceId. Before start() it saves a
+    /// fresh id for the client to pick up.
+    @discardableResult
+    public static func resetDeviceId() -> String {
+        if let client = shared { return client.resetDeviceId() }
+        if launchedForPlaytest {
+            print("Ravensight: resetDeviceId is ignored during a playtest run")
+            return ""
+        }
+        let fresh = RavensightClient.mintDeviceId()
+        UserDefaults.standard.set(fresh, forKey: RavensightClient.deviceIdKey)
+        UserDefaults.standard.removeObject(forKey: RavensightClient.markerKey)
+        return fresh
+    }
+
+    /// The runtime switch on the shared client, not the player's choice.
+    /// Before 0.2.0 this was the documented privacy toggle; it is not saved,
+    /// so use setTrackingEnabled for a player's opt-out.
+    @available(*, deprecated, message: "Use Ravensight.setTrackingEnabled(_:) for the player's choice, or Ravensight.shared?.setEnabled(_:) for a runtime switch.")
     public static func setEnabled(_ enabled: Bool) {
         shared?.setEnabled(enabled)
     }
 
+    /// True when the launch environment carries a playtest token, for the
+    /// calls made before start().
+    private static var launchedForPlaytest: Bool {
+        let token = ProcessInfo.processInfo.environment["RAVENSIGHT_PLAYTEST_TOKEN"] ?? ""
+        return !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// The feedback categories the server accepts.
+    public static let feedbackCategories = RavensightClient.feedbackCategories
+
+    /// This SDK's version.
+    public static let sdkVersion = RavensightClient.sdkVersion
+
     /// True once a session exists and events can leave the queue.
     public static var isReady: Bool {
         return shared?.isReady ?? false
+    }
+
+    /// Why the shared client is not sending, or nil when it is ready (or not
+    /// started). See RavensightClient.statusReason for the values.
+    public static var statusReason: String? {
+        return shared?.statusReason
+    }
+
+    /// The current session token, nil until a session opens. Pass it to your
+    /// game server as joinToken.
+    public static var sessionToken: String? {
+        return shared?.sessionToken
     }
 }
