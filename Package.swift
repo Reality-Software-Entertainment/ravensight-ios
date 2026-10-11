@@ -13,7 +13,8 @@ let package = Package(
     targets: [
         .target(
             name: "Ravensight",
-            path: "Sources/Ravensight"
+            path: "Sources/Ravensight",
+            resources: [.copy("PrivacyInfo.xcprivacy")]
         ),
         .testTarget(
             name: "RavensightTests",
