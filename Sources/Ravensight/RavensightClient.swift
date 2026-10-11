@@ -16,7 +16,12 @@ import UIKit
 /// always delivered on the main queue.
 ///
 /// Most games use the static Ravensight facade instead of holding a client.
-public final class RavensightClient {
+///
+/// Sendable by construction rather than by the compiler's proof: mutable
+/// state is only touched on workQueue (a serial queue), the snapshot and the
+/// status handler only under snapshotLock, and the lifecycle observer only
+/// on the main thread. That is why it is marked @unchecked.
+public final class RavensightClient: @unchecked Sendable {
     /// This SDK's version.
     public static let sdkVersion = "0.2.0"
     /// The default host. "/api/v1" is appended for you.
@@ -230,10 +235,11 @@ public final class RavensightClient {
     }
 
     /// iOS: the app is about to resign active. A flush, but not an explicit
-    /// one: after a refused key it sends nothing.
+    /// one: it respects any backoff or Retry-After window and sends nothing
+    /// after a refused key. Only the quit path skips the window.
     func handleWillResignActive() {
         workQueue.async {
-            self.pump(ignoreBackoff: !self.core.keyRefused)
+            self.pump()
         }
     }
 
@@ -264,12 +270,14 @@ public final class RavensightClient {
     /// one with game_started.
     func handleWillEnterForeground() {
         workQueue.async {
+            // Before the first foreground (a deferred start) the marker is
+            // left alone: performStart still has to report it.
+            guard self.foreground else { return }
             if !self.isPlaytest {
                 self.defaults.removeObject(forKey: RavensightClient.markerKey)
             }
             guard let leftAtMs = self.backgroundedAtMs else { return }
             self.backgroundedAtMs = nil
-            guard self.foreground else { return }
 
             let nowMs = self.now()
             let timeoutMs = Int64(self.configuration.sessionTimeout * 1000)
@@ -668,10 +676,18 @@ public final class RavensightClient {
 
         case .send(let request, let purpose):
             requestInFlight = true
+            let sent = core.stamp
             transport.send(request) { [weak self] response in
                 guard let self = self else { return }
                 self.workQueue.async {
                     self.requestInFlight = false
+                    if self.core.isStale(purpose, since: sent) {
+                        // Opt-out, disable or resetDeviceId happened while
+                        // this was in flight: it belongs to the old state.
+                        self.log("ignored a response that no longer applies")
+                        self.pump()
+                        return
+                    }
                     let effects = self.core.handle(
                         response: response, for: purpose, nowMs: self.now()
                     )

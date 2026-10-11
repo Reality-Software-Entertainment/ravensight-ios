@@ -46,6 +46,10 @@ All notable changes to this package are documented here.
   `X-Ravensight-Playtest` header on every request, `isPlaytest`.
 * Public `sessionToken` for handing the session to a game server, and
   `feedbackCategories` and `sdkVersion`.
+* `Sendable` on `RavensightClient` (checked by design: one serial queue and
+  a lock), `RavensightConfiguration`, `RavensightRequest`,
+  `RavensightResponse`, `RavensightError` and the URLSession transport, so a
+  Swift 6 app builds against the package without diagnostics.
 * `PrivacyInfo.xcprivacy`: `UserDefaults` with reason `CA92.1`, Device ID and
   Product Interaction (not linked, not tracking, Analytics), no tracking.
 * Client tests over a fake transport, clock and storage for every opt-out
@@ -55,12 +59,18 @@ All notable changes to this package are documented here.
 ### Fixed
 
 * `Ravensight.setEnabled(false)` called before `start()` was silently
-  ignored, so a player who opted out was still tracked.
+  ignored, so a player who opted out was still tracked. It is now held for
+  the process and applied at `start()` (never saved, with a console line
+  pointing at `setTrackingEnabled`).
+* A session or batch answer that arrives after `resetDeviceId()`, an
+  opt-out or `setEnabled(false)` is ignored, so the old identity's session
+  is not adopted and a stale `202` cannot remove newer events.
 * `game_exited` was only sent on `willTerminate`, which iOS rarely delivers,
   and a session survived any length of time in the background.
 * A `403 tracking_disabled` from the session or batch endpoint is now the
   kill switch instead of a retry.
-* `Retry-After` is honoured on `503` as well as `429`.
+* `Retry-After` is honoured on `503` as well as `429`, and on the settings
+  check.
 * A batch `401` re-opens the session twice in a row before backing off.
 * Fetching suggestions while tracking is off no longer makes a request.
 * New device ids take 16 bytes from the system's secure random generator.

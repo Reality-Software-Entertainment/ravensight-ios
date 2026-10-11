@@ -3,7 +3,7 @@ import Foundation
 /// One outbound HTTP request. Deliberately free of URLSession types so the
 /// batching and retry logic can be exercised with a fake transport in a plain
 /// unit test.
-public struct RavensightRequest: Equatable {
+public struct RavensightRequest: Equatable, Sendable {
     public var method: String
     public var url: String
     public var headers: [String: String]
@@ -21,7 +21,7 @@ public struct RavensightRequest: Equatable {
 /// One inbound HTTP response. A transport level failure (no connection, DNS,
 /// timeout) is reported as status 0 so the protocol core treats it like any
 /// other retryable outcome instead of throwing into game code.
-public struct RavensightResponse {
+public struct RavensightResponse: Sendable {
     public var status: Int
     public var body: Data?
     /// Raw Retry-After header value, or nil.

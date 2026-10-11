@@ -15,11 +15,14 @@ side kill switch, in one Swift package and no third party dependencies.
 
 What has been run, and what has not:
 
-* `swift build` and `swift test` on macOS (Swift 6.4, Xcode 27.0): 77 tests,
+* `swift build` and `swift test` on macOS (Swift 6.4, Xcode 27.0): 83 tests,
   the protocol core with a fake clock and the client with a fake transport,
   a fake clock and an isolated `UserDefaults` suite.
 * `xcodebuild test` on the iOS Simulator (iPhone 17, iOS 27.0, Xcode 27.0):
-  the same 77 tests on iOS. The lifecycle tests call the client's handlers
+  the same 83 tests on iOS.
+* A Swift 6 language mode app (tools version 6.0) built against the package
+  with no diagnostics: the client and the public value types are
+  `Sendable`. The lifecycle tests call the client's handlers
   directly; the UIKit notifications that drive them in an app, the
   background task assertion and a real swipe from the app switcher have not
   been exercised.
@@ -114,6 +117,9 @@ Everything game code needs is static on `Ravensight`:
 
 `Ravensight.setEnabled(_:)` still exists but is deprecated: it is the
 runtime switch below, not saved, and it was never a safe player opt-out.
+Called before `start`, its value is held for this process and applied when
+`start` runs (with a console line pointing at `setTrackingEnabled`), so a
+0.1 integration that called it first keeps its behaviour.
 
 Event values can be strings, numbers, bools, nulls, nested dictionaries or
 arrays (`[String: Any]`). Anything else (a `Date`, a custom struct) is
@@ -189,7 +195,11 @@ background. So on iOS a session ends by time in the background:
   session has expired.
 * **A launch into the background** (background fetch, a silent push):
   `game_started`, the settings check and the session wait until the app
-  first comes to the foreground.
+  first becomes active, and `game_started` is stamped at that moment. A
+  scene based app can report the background state while it launches, so it
+  usually takes this path for the fraction of a second before its first
+  scene is active. A marker left by an earlier swipe is still reported
+  first when the app becomes active.
 
 ## Opting out and resetting
 
@@ -293,8 +303,12 @@ Rotate it from the dashboard at any time.
   so events still queued when the process dies are lost.
 * **Session expiry.** A `401` on a batch clears the session, opens a new one
   and resends the same batch, at most twice in a row before backing off.
-* **Rate limits.** A `429` honors `Retry-After` in seconds, and so does a
-  `503`. With no such header the SDK backs off exponentially from 10
+* **Answers that no longer apply.** A session or batch answer that arrives
+  after `resetDeviceId`, an opt-out or `setEnabled(false)` is ignored, so an
+  old identity's session is never adopted and newer events are never
+  removed by an older batch's `202`.
+* **Rate limits.** A `429` honors `Retry-After` in seconds, on the settings
+  check as on every other request, and so does a `503`. With no such header the SDK backs off exponentially from 10
   seconds to a 5 minute ceiling. The queue is held.
 * **Oversize batches.** A `400` halves the batch and retries down to a single
   event. An event still rejected on its own is dropped, counted and logged

@@ -176,6 +176,41 @@ struct RavensightCore {
     private(set) var batchLimit = RavensightCore.maxBatchSize
     private(set) var consecutiveUnauthorized = 0
 
+    /// Bumped whenever the queue is discarded (opt-out, disable, reset,
+    /// kill switch, stop). A batch answer from before the bump is stale.
+    private(set) var queueGeneration = 0
+    /// Bumped whenever the session is dropped. A session answer from before
+    /// the bump belongs to a session (or identity) that no longer applies.
+    private(set) var sessionGeneration = 0
+
+    /// What a response is checked against, captured when its request left.
+    struct Stamp: Equatable {
+        var queue: Int
+        var session: Int
+        var exit: PendingExit?
+    }
+
+    var stamp: Stamp {
+        return Stamp(queue: queueGeneration, session: sessionGeneration, exit: pendingExit)
+    }
+
+    /// True when a response no longer applies to the current state: a batch
+    /// sent before the queue was discarded, a session opened before the
+    /// session (or the device id) was dropped, or an exit that was replaced.
+    /// The driver drops such a response instead of handling it.
+    func isStale(_ purpose: Purpose, since sent: Stamp) -> Bool {
+        switch purpose {
+        case .settings:
+            return false
+        case .session:
+            return sent.session != sessionGeneration
+        case .batch:
+            return sent.queue != queueGeneration
+        case .exit:
+            return sent.exit != pendingExit
+        }
+    }
+
     private var counters = RavensightCoreStats()
 
     init(config: RavensightCoreConfig) {
@@ -286,6 +321,7 @@ struct RavensightCore {
 
     /// Drop the current session so the next step opens a fresh one.
     mutating func invalidateSession() {
+        sessionGeneration += 1
         sessionToken = nil
         sessionExpiresAtMs = 0
     }
@@ -298,6 +334,7 @@ struct RavensightCore {
     }
 
     private mutating func discardQueue() {
+        queueGeneration += 1
         counters.dropped += pendingEvents.count
         pendingEvents.removeAll()
         sessionWanted = false
@@ -323,6 +360,9 @@ struct RavensightCore {
         if keyRefused && !ignoringBackoff { return .idle }
 
         if !settingsChecked {
+            if !ignoringBackoff && nowMs < nextAttemptAtMs {
+                return .wait(untilMs: nextAttemptAtMs)
+            }
             return .send(settingsRequest(), .settings)
         }
         guard trackingEnabled else { return .idle }
@@ -347,7 +387,7 @@ struct RavensightCore {
     mutating func handle(response: RavensightResponse, for purpose: Purpose, nowMs: Int64) -> [Effect] {
         switch purpose {
         case .settings:
-            return handleSettings(response)
+            return handleSettings(response, nowMs: nowMs)
         case .session:
             return handleSession(response, nowMs: nowMs)
         case .batch(let count):
@@ -373,7 +413,13 @@ struct RavensightCore {
 
     // MARK: Response handling
 
-    private mutating func handleSettings(_ response: RavensightResponse) -> [Effect] {
+    private mutating func handleSettings(_ response: RavensightResponse, nowMs: Int64) -> [Effect] {
+        if response.status == 429 || response.status == 503 {
+            // Ask again once Retry-After has passed, like every other endpoint.
+            applyRetryAfter(response, nowMs: nowMs)
+            if response.status == 429 { lastFailure = Reason.rateLimited }
+            return []
+        }
         settingsChecked = true
 
         switch response.status {

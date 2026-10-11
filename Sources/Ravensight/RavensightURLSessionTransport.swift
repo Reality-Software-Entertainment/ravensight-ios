@@ -6,7 +6,7 @@ import FoundationNetworking
 /// The production transport: URLSession, nothing else. Translates every
 /// failure into a RavensightResponse so the protocol core never sees a thrown
 /// error.
-public final class RavensightURLSessionTransport: RavensightTransport {
+public final class RavensightURLSessionTransport: RavensightTransport, Sendable {
     private let session: URLSession
 
     public init(timeout: TimeInterval = 15) {

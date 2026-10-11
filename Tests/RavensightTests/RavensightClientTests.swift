@@ -16,6 +16,25 @@ private final class FakeTransport: RavensightTransport {
     var batchError: String?
     /// Requests whose completion is never called (a hung network).
     var hang = false
+    /// Requests to this suffix wait until release(_:) answers them.
+    var holdSuffix: String?
+    private var held: [(RavensightResponse) -> Void] = []
+
+    var heldCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return held.count
+    }
+
+    /// Answers every held request with this response.
+    func release(_ response: RavensightResponse) {
+        lock.lock()
+        let waiting = held
+        held = []
+        holdSuffix = nil
+        lock.unlock()
+        for completion in waiting { completion(response) }
+    }
 
     var requests: [RavensightRequest] {
         lock.lock()
@@ -47,6 +66,11 @@ private final class FakeTransport: RavensightTransport {
         lock.lock()
         recorded.append(request)
         let hung = hang
+        if let suffix = holdSuffix, request.url.hasSuffix(suffix) {
+            held.append(completion)
+            lock.unlock()
+            return
+        }
         lock.unlock()
         if hung { return }
 
@@ -322,6 +346,7 @@ final class RavensightClientTests: XCTestCase {
     }
 
     func testFacadeSavesTheOptOutBeforeStart() {
+        Ravensight.resetForTesting()
         XCTAssertNil(Ravensight.shared, "the facade is never started in tests")
         let standard = UserDefaults.standard
         let saved = standard.object(forKey: RavensightClient.optOutKey)
@@ -719,5 +744,107 @@ final class RavensightClientTests: XCTestCase {
         XCTAssertFalse(client.track("f"))
         flushAndWait(client)
         XCTAssertEqual(transport.requests.count, before)
+    }
+
+    // MARK: Fix round 1
+
+    func testDeferredStartStillReportsTheColdLaunchMarker() {
+        let transport = FakeTransport()
+        let leftAt = clock.nowMs / 1000 - 300
+        defaults.set([
+            "sessionToken": "sess_swiped",
+            "expiresAt": clock.nowMs / 1000 + 3600,
+            "backgroundedAt": leftAt,
+        ] as [String: Any], forKey: RavensightClient.markerKey)
+
+        let client = makeClient(transport: transport, lifecycleEvents: true, backgroundLaunch: true)
+        client.start()
+        client.handleWillEnterForeground()
+        client.handleDidBecomeActive()
+        settle(client)
+
+        XCTAssertEqual(transport.requests.first?.headers["X-Session-Token"], "sess_swiped", "sent first")
+        let exits = transport.sentEvents().filter { $0.name == "game_exited" }
+        XCTAssertEqual(exits.count, 1)
+        XCTAssertEqual(exits.first?.token, "sess_swiped")
+        XCTAssertEqual(exits.first?.timestamp, leftAt)
+        XCTAssertNil(defaults.object(forKey: RavensightClient.markerKey))
+    }
+
+    @available(*, deprecated)
+    private func legacyDisable() {
+        Ravensight.setEnabled(false)
+    }
+
+    @available(*, deprecated)
+    func testDeprecatedSetEnabledBeforeStartStillHolds() {
+        Ravensight.resetForTesting()
+        defer { Ravensight.resetForTesting() }
+        let transport = FakeTransport()
+        legacyDisable() // the 0.1 order: the toggle first, then start
+        let client = Ravensight.start(RavensightConfiguration(ingestKey: "gt_live_test")) { configuration in
+            var configuration = configuration
+            configuration.apiUrl = "https://fake.test"
+            configuration.flushInterval = 0
+            return self.makeClient(transport: transport, lifecycleEvents: true) { $0 = configuration }
+        }
+        client.track("ignored")
+        flushAndWait(client)
+        XCTAssertTrue(transport.requests.isEmpty)
+        XCTAssertEqual(client.statusReason, "disabled")
+        XCTAssertFalse(defaults.bool(forKey: RavensightClient.optOutKey), "never saved")
+    }
+
+    func testSessionAnswerFromBeforeAResetIsIgnored() {
+        let transport = FakeTransport()
+        transport.holdSuffix = "/session"
+        let client = makeClient(transport: transport)
+        client.start()
+        client.track("before_reset")
+        client.flush()
+        settle(client)
+        XCTAssertEqual(transport.heldCount, 1)
+
+        let fresh = client.resetDeviceId()
+        settle(client)
+        transport.release(RavensightResponse(
+            status: 201,
+            body: try? JSONSerialization.data(withJSONObject: ["token": "sess_old_identity", "expiresIn": 86_400])
+        ))
+        settle(client)
+        XCTAssertNil(client.sessionToken, "the old identity's session is not adopted")
+
+        client.track("after_reset")
+        flushAndWait(client)
+        let body = transport.requests(suffix: "/session").last?.body
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        XCTAssertEqual(body?["deviceId"] as? String, fresh)
+        XCTAssertEqual(transport.sentEvents().last?.name, "after_reset")
+        XCTAssertNotEqual(transport.sentEvents().last?.token, "sess_old_identity")
+    }
+
+    func testBatchAnswerFromBeforeAnOptOutDoesNotDropNewEvents() {
+        let transport = FakeTransport()
+        transport.holdSuffix = "/track/batch"
+        let client = makeClient(transport: transport)
+        client.start()
+        client.track("a")
+        client.flush()
+        settle(client)
+        XCTAssertEqual(transport.heldCount, 1)
+
+        client.setTrackingEnabled(false)
+        client.setTrackingEnabled(true)
+        client.track("b")
+        settle(client)
+        transport.batchStatus = 500 // the follow-up send fails, so b stays visible
+        transport.release(RavensightResponse(status: 202))
+        settle(client)
+        XCTAssertEqual(client.queuedEventCount, 1, "the stale 202 did not remove b")
+
+        transport.batchStatus = 202
+        flushAndWait(client)
+        XCTAssertEqual(client.queuedEventCount, 0)
+        XCTAssertEqual(transport.sentEvents().last?.name, "b")
     }
 }

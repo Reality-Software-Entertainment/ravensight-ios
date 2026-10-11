@@ -1,7 +1,7 @@
 import Foundation
 
 /// Everything the SDK needs to run. Only the ingest key is required.
-public struct RavensightConfiguration {
+public struct RavensightConfiguration: Sendable {
     /// Your PUBLISHABLE ingest key (gt_live_...). Safe to ship in a client
     /// build: it can open sessions, read the tracking kill switch and read
     /// this game's design suggestions. It cannot read analytics, read
@@ -66,7 +66,7 @@ public struct RavensightConfiguration {
 
 /// Reported by the explicit request helpers (feedback, suggestions).
 /// Tracking never throws and never reports errors.
-public struct RavensightError: Error, Equatable, CustomStringConvertible {
+public struct RavensightError: Error, Equatable, Sendable, CustomStringConvertible {
     /// Stable machine readable code, e.g. "disabled", "empty_message",
     /// "invalid_category", "invalid_rating", "no_session", "rate_limited",
     /// "http_400", "network_error".

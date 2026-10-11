@@ -851,4 +851,42 @@ final class RavensightCoreTests: XCTestCase {
         XCTAssertEqual(RavensightCore.feedbackRefusal(message: "ok", category: nil, rating: 6), "invalid_rating")
         XCTAssertEqual(RavensightCore.feedbackRefusal(message: "ok", category: nil, rating: -1), "invalid_rating")
     }
+
+    // MARK: Fix round 1
+
+    func testSettingsRateLimitHonoursRetryAfter() {
+        var core = makeCore()
+        guard case .send(_, .settings) = core.nextStep(nowMs: nowMs) else { return XCTFail("settings") }
+        _ = core.handle(response: RavensightResponse(status: 429, retryAfter: "30"), for: .settings, nowMs: nowMs)
+        XCTAssertEqual(core.statusReason, "rate_limited")
+        XCTAssertEqual(core.nextStep(nowMs: nowMs), .wait(untilMs: nowMs + 30_000))
+        nowMs += 30_000
+        guard case .send(_, .settings) = core.nextStep(nowMs: nowMs) else { return XCTFail("asked again") }
+    }
+
+    func testStaleAnswersAreRecognised() {
+        var core = makeCore()
+        boot(&core)
+        core.track(name: "e", data: nil, nowMs: nowMs)
+        let beforeReset = core.stamp
+        XCTAssertFalse(core.isStale(.session, since: beforeReset))
+        XCTAssertFalse(core.isStale(.batch(count: 1), since: beforeReset))
+
+        core.replaceDeviceId("dev_new")
+        XCTAssertTrue(core.isStale(.session, since: beforeReset))
+        XCTAssertTrue(core.isStale(.batch(count: 1), since: beforeReset))
+        XCTAssertFalse(core.isStale(.settings, since: beforeReset))
+
+        let beforeOptOut = core.stamp
+        core.setOptedOut(true)
+        core.setOptedOut(false)
+        XCTAssertTrue(core.isStale(.batch(count: 1), since: beforeOptOut))
+        XCTAssertFalse(core.isStale(.session, since: beforeOptOut), "same identity, same session")
+
+        core.setPendingExit(.init(sessionToken: "s", timestamp: 1, retry: true))
+        let withExit = core.stamp
+        XCTAssertFalse(core.isStale(.exit(retry: true), since: withExit))
+        core.setOptedOut(true)
+        XCTAssertTrue(core.isStale(.exit(retry: true), since: withExit))
+    }
 }
