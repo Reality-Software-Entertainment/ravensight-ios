@@ -55,6 +55,7 @@ public final class RavensightClient {
     private var retryWorkItem: DispatchWorkItem?
     private var flushTimer: DispatchSourceTimer?
     private var flushWaiters: [Waiter] = []
+    /// Created and read on the main thread only.
     private var lifecycle: RavensightLifecycle?
     private var warned: Set<String> = []
     private var lastNotifiedReason: String?
@@ -180,8 +181,10 @@ public final class RavensightClient {
             }
         }
         if installsLifecycleObservers {
-            DispatchQueue.main.async {
-                self.installLifecycleHooks()
+            if Thread.isMainThread {
+                installLifecycleHooks()
+            } else {
+                DispatchQueue.main.async { self.installLifecycleHooks() }
             }
         }
     }
@@ -194,10 +197,15 @@ public final class RavensightClient {
         pump()
     }
 
+    /// Main thread only. A scene based app can report the background state
+    /// while it launches, so after the observers are in place the state is
+    /// read again: an app that is already active runs a deferred start now
+    /// instead of waiting for a notification it may have missed.
     private func installLifecycleHooks() {
-        workQueue.async {
-            guard self.lifecycle == nil else { return }
-            self.lifecycle = RavensightLifecycle(client: self)
+        guard lifecycle == nil else { return }
+        lifecycle = RavensightLifecycle(client: self)
+        if !isBackgroundLaunch() && RavensightClient.applicationIsActive() {
+            handleDidBecomeActive()
         }
     }
 
@@ -839,6 +847,15 @@ public final class RavensightClient {
         return UIApplication.shared.applicationState == .background
         #else
         return false
+        #endif
+    }
+
+    /// True when the app is in the foreground and active. Main thread only.
+    private static func applicationIsActive() -> Bool {
+        #if canImport(UIKit) && !os(watchOS)
+        return UIApplication.shared.applicationState == .active
+        #else
+        return true
         #endif
     }
 
