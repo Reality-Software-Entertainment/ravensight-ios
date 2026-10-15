@@ -889,4 +889,46 @@ final class RavensightCoreTests: XCTestCase {
         core.setOptedOut(true)
         XCTAssertTrue(core.isStale(.exit(retry: true), since: withExit))
     }
+
+    // MARK: Restored queue (0.3.0)
+
+    func testRestoredEventsGoUnderTheirOwnSessionThenDemoteOn401() {
+        var core = makeCore()
+        let old = (1...3).map { RavensightEvent(name: "old_\($0)", data: [:], timestamp: 1) }
+        core.restore(events: old, sessionToken: "sess_old", expiresAtMs: nowMs + 3_600_000, nowMs: nowMs)
+        XCTAssertEqual(core.pendingCount, 3)
+        XCTAssertEqual(core.stats.restored, 3)
+        boot(&core)
+
+        guard case .send(let request, .restored(let count)) = core.nextStep(nowMs: nowMs) else {
+            return XCTFail("restored events go first")
+        }
+        XCTAssertEqual(count, 3)
+        XCTAssertEqual(request.headers["X-Session-Token"], "sess_old")
+
+        _ = core.handle(response: RavensightResponse(status: 401), for: .restored(count: 3), nowMs: nowMs)
+        XCTAssertNil(core.restoredBatch)
+        XCTAssertEqual(core.pendingEvents.map { $0.name }, ["old_1", "old_2", "old_3"], "moved to the live queue")
+        openSession(&core)
+    }
+
+    func testRestoredEventsWithAnExpiredSessionJoinTheLiveQueue() {
+        var core = makeCore(maxQueueSize: 2)
+        core.track(name: "live", data: nil, nowMs: nowMs)
+        let old = (1...3).map { RavensightEvent(name: "old_\($0)", data: [:], timestamp: 1) }
+        core.restore(events: old, sessionToken: "sess_old", expiresAtMs: nowMs - 1, nowMs: nowMs)
+        XCTAssertNil(core.restoredBatch)
+        XCTAssertEqual(core.pendingEvents.map { $0.name }, ["old_3", "live"], "the cap keeps the newest")
+        XCTAssertEqual(core.stats.dropped, 2)
+    }
+
+    func testAcceptedCountsQueueAcceptanceOnly() {
+        var core = makeCore()
+        core.track(name: "a", data: nil, nowMs: nowMs)
+        core.setOptedOut(true)
+        core.track(name: "b", data: nil, nowMs: nowMs)
+        XCTAssertEqual(core.stats.accepted, 1)
+        XCTAssertEqual(core.stats.dropped, 1)
+        XCTAssertEqual(core.stats.sent, 0)
+    }
 }

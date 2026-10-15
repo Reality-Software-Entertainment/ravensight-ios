@@ -23,7 +23,7 @@ import UIKit
 /// on the main thread. That is why it is marked @unchecked.
 public final class RavensightClient: @unchecked Sendable {
     /// This SDK's version.
-    public static let sdkVersion = "0.2.0"
+    public static let sdkVersion = "0.3.0"
     /// The default host. "/api/v1" is appended for you.
     public static let defaultApiUrl = RavensightCore.defaultApiUrl
     /// Server hard limit on POST /track/batch.
@@ -41,14 +41,23 @@ public final class RavensightClient: @unchecked Sendable {
     /// True when a Ravensight Playtest token was found at construction.
     public let isPlaytest: Bool
 
-    private let workQueue = DispatchQueue(label: "io.ravensight.sdk")
-    private let transport: RavensightTransport
-    private let now: () -> Int64
+    /// True for a synthetic session: a Ravensight Playtest run driven by an
+    /// agent, not a person. Same value as isPlaytest.
+    public var isSynthetic: Bool { return isPlaytest }
+
+    /// The id this run sends while it is a synthetic session (pt-<runId>),
+    /// nil in a normal session. It lives in memory only and is never saved,
+    /// and deviceId never returns it.
+    public let playtestDeviceId: String?
+
+    let workQueue = DispatchQueue(label: "io.ravensight.sdk")
+    let transport: RavensightTransport
+    let now: () -> Int64
     private let defaults: UserDefaults
     private let isBackgroundLaunch: () -> Bool
     private let installsLifecycleObservers: Bool
 
-    private var core: RavensightCore
+    var core: RavensightCore
     private var started = false
     /// False until the app has been in the foreground once since start().
     private var foreground = false
@@ -65,9 +74,25 @@ public final class RavensightClient: @unchecked Sendable {
     private var warned: Set<String> = []
     private var lastNotifiedReason: String?
 
+    /// The persisted queue, nil unless persistQueue is on in a normal session.
+    private let queueStore: RavensightQueueStore?
+    /// True while the saved queue is still on disk waiting to be loaded (the
+    /// client was built disabled).
+    private var restoreDue = false
+    private var persistedRevision = -1
+    private var persistedSessionToken: String?
+    private var lastDeliveryRecord: RavensightDelivery?
+
+    /// Seconds a report waits for a session to open, and between status
+    /// checks while a screenshot is processed. Tests shorten them.
+    var reportSessionWait: TimeInterval = 10
+    var reportPollInterval: TimeInterval = 2
+    var reportPollAttempts = 35
+
     private let snapshotLock = NSLock()
     private var snapshot = Snapshot()
     private var statusHandler: ((String?) -> Void)?
+    private var flushHandler: ((RavensightFlushOutcome) -> Void)?
 
     private struct Snapshot {
         var enabled = true
@@ -77,7 +102,9 @@ public final class RavensightClient: @unchecked Sendable {
         var sessionToken: String?
         var queuedEventCount = 0
         var reason: String?
+        /// The durable id. Never a synthetic one.
         var deviceId = ""
+        var stats = RavensightStats()
     }
 
     private struct Waiter {
@@ -105,7 +132,8 @@ public final class RavensightClient: @unchecked Sendable {
         defaults: UserDefaults = .standard,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         isBackgroundLaunch: (() -> Bool)? = nil,
-        installsLifecycleObservers: Bool = true
+        installsLifecycleObservers: Bool = true,
+        queueDirectory: URL? = nil
     ) {
         self.configuration = configuration
         self.transport = transport
@@ -122,16 +150,30 @@ public final class RavensightClient: @unchecked Sendable {
         )
         self.isPlaytest = token != nil
 
-        // A playtest run never reads or writes the saved id or the saved
-        // opt-out: its identity is the run.
+        // A synthetic (playtest) run sends pt-<runId>, held in memory only:
+        // it never writes the saved id and ignores the saved opt-out. The
+        // durable id is read (never created or replaced) so deviceId can
+        // keep reporting it to the app.
         let deviceId: String
+        let durableId: String
         let optedOut: Bool
         if token != nil {
             deviceId = runId.map { "pt-" + $0 } ?? ""
+            durableId = defaults.string(forKey: RavensightClient.deviceIdKey) ?? ""
             optedOut = false
+            self.playtestDeviceId = deviceId
         } else {
             deviceId = RavensightClient.loadOrCreateDeviceId(defaults)
+            durableId = deviceId
             optedOut = defaults.bool(forKey: RavensightClient.optOutKey)
+            self.playtestDeviceId = nil
+        }
+        if configuration.persistQueue && token == nil {
+            self.queueStore = RavensightQueueStore.defaultFileURL(
+                ingestKey: configuration.ingestKey, directory: queueDirectory
+            ).map(RavensightQueueStore.init(fileURL:))
+        } else {
+            self.queueStore = nil
         }
 
         let coreConfig = RavensightCoreConfig(
@@ -151,7 +193,18 @@ public final class RavensightClient: @unchecked Sendable {
             core.stop(reason: RavensightCore.Reason.sessionFailed)
         }
         self.core = core
-        self.lastNotifiedReason = core.statusReason
+        self.snapshot.deviceId = durableId
+        if let store = queueStore {
+            if optedOut {
+                // The player said no: nothing they queued earlier is kept.
+                store.delete()
+            } else {
+                restoreDue = true
+                restoreQueueIfDue()
+            }
+        }
+        self.persistedRevision = self.core.queueRevision
+        self.lastNotifiedReason = self.core.statusReason
         if token != nil && runId == nil {
             warnOnce(
                 "playtest_no_run",
@@ -164,6 +217,48 @@ public final class RavensightClient: @unchecked Sendable {
     deinit {
         flushTimer?.cancel()
         retryWorkItem?.cancel()
+    }
+
+    /// Loads the persisted queue once events may be queued. Called from the
+    /// initializer and again when a client built disabled is enabled.
+    private func restoreQueueIfDue() {
+        guard restoreDue, let store = queueStore, core.canQueue else { return }
+        restoreDue = false
+        let nowMs = now()
+        for group in store.load(nowMs: nowMs) {
+            core.restore(
+                events: group.events,
+                sessionToken: group.sessionToken,
+                expiresAtMs: group.expiresAtMs,
+                nowMs: nowMs
+            )
+        }
+        if core.stats.restored > 0 {
+            log("restored \(core.stats.restored) event(s) from the persisted queue")
+        }
+    }
+
+    /// Mirrors the queue to disk when it, or the session it would be sent
+    /// under, changed. Work queue only.
+    private func persistQueueIfChanged() {
+        guard let store = queueStore, !restoreDue else { return }
+        let valid = core.isSessionValid(nowMs: now())
+        let token = valid ? core.sessionToken : nil
+        guard core.queueRevision != persistedRevision || token != persistedSessionToken else { return }
+        persistedRevision = core.queueRevision
+        persistedSessionToken = token
+        var groups: [RavensightQueueStore.Group] = []
+        if let batch = core.restoredBatch {
+            groups.append(.init(sessionToken: batch.sessionToken, expiresAtMs: batch.expiresAtMs, events: batch.events))
+        }
+        groups.append(.init(
+            sessionToken: token,
+            expiresAtMs: valid ? core.sessionExpiresAtMs : 0,
+            events: core.pendingEvents
+        ))
+        if !store.save(groups) {
+            warnOnce("queue_write", "could not write the persisted queue; events stay in memory.")
+        }
     }
 
     // MARK: Lifecycle
@@ -404,8 +499,12 @@ public final class RavensightClient: @unchecked Sendable {
     /// Queues an event. Nothing is sent per call: the queue goes out in
     /// batches of up to 50 via POST /api/v1/track/batch on the flush timer,
     /// as soon as 50 are queued, on flush(), on background and on quit.
-    /// Safe to call before start(). Returns false when nothing was queued
-    /// (disabled, opted out, switched off by the server, or an empty name).
+    /// Safe to call before start().
+    ///
+    /// The return value is queue acceptance, not delivery: true means the
+    /// event was queued, false means nothing was queued (disabled, opted
+    /// out, stopped, switched off by the server, or an empty name). Whether
+    /// the server has it shows in stats.delivered, lastDelivery and onFlush.
     @discardableResult
     public func track(_ name: String, data: [String: Any]? = nil) -> Bool {
         let current = readSnapshot()
@@ -572,30 +671,61 @@ public final class RavensightClient: @unchecked Sendable {
     /// discards anything still queued; enabling a client built with
     /// enabled = false starts it.
     public func setEnabled(_ enabled: Bool) {
+        snapshotLock.lock()
+        snapshot.enabled = enabled
+        snapshotLock.unlock()
         workQueue.async {
             self.core.setEnabled(enabled)
-            if enabled { self.queueGameStartedIfDue() }
+            if enabled {
+                self.restoreQueueIfDue()
+                self.queueGameStartedIfDue()
+            }
             self.stateChanged()
             if enabled { self.pump() }
         }
     }
 
-    /// Forgets this install's analytics identity: mints a new random id,
-    /// saves it, clears the queue and ends the session (the next one opens
-    /// under the new id). Returns the new id. A no-op under a playtest run,
-    /// which returns the run's id.
+    /// The one control that stops everything, in a normal session and in a
+    /// synthetic (playtest) one alike: the flush timer stops, the queue is
+    /// cleared (and the persisted queue file deleted), and track, feedback
+    /// and reports are refused until resumeTelemetry(). No request of any
+    /// kind is made while stopped. Nothing is saved: the next launch starts
+    /// normally. Same switch as setEnabled(false).
+    ///
+    /// Use it for "stop now" (a privacy screen, a parental gate, a
+    /// synthetic run that must go quiet). For the player's lasting choice
+    /// use setTrackingEnabled(false), which is saved but does not stop a
+    /// synthetic session.
+    public func stopAllTelemetry() {
+        setEnabled(false)
+    }
+
+    /// Undoes stopAllTelemetry() for this run. A saved player opt-out still
+    /// wins: in a normal session nothing is sent while the player has opted
+    /// out. Same switch as setEnabled(true).
+    public func resumeTelemetry() {
+        setEnabled(true)
+    }
+
+    /// Forgets this install's durable analytics identity: mints a new random
+    /// id, saves it and returns it. Never returns a synthetic id.
+    ///
+    /// In a normal session the queue is cleared and the session ends (the
+    /// next one opens under the new id). In a synthetic (playtest) session
+    /// the run carries on as pt-<runId>, untouched; the new durable id is
+    /// saved for the next normal launch and returned.
     @discardableResult
     public func resetDeviceId() -> String {
-        if isPlaytest {
-            print("Ravensight: resetDeviceId is ignored during a playtest run")
-            return deviceId
-        }
         let fresh = RavensightClient.mintDeviceId()
         defaults.set(fresh, forKey: RavensightClient.deviceIdKey)
         defaults.removeObject(forKey: RavensightClient.markerKey)
         snapshotLock.lock()
         snapshot.deviceId = fresh
         snapshotLock.unlock()
+        if isPlaytest {
+            print("Ravensight: resetDeviceId saved a new durable id for the next normal launch; this synthetic run keeps its playtest id")
+            return fresh
+        }
         workQueue.async {
             self.core.replaceDeviceId(fresh)
             self.stateChanged()
@@ -603,9 +733,12 @@ public final class RavensightClient: @unchecked Sendable {
         return fresh
     }
 
-    /// Random per install id (dev_ plus 32 hex), persisted in UserDefaults,
-    /// or pt-<runId> in memory only under a playtest run. No hardware
-    /// identifier is ever collected.
+    /// The durable per install id (dev_ plus 32 hex), saved in UserDefaults.
+    /// Safe to mirror in your own storage: it is never a synthetic id. In a
+    /// synthetic (playtest) session it still returns the durable id, or an
+    /// empty string when this install has never run a normal session; the
+    /// id the run actually sends is playtestDeviceId. No hardware identifier
+    /// is ever collected.
     public var deviceId: String { return readSnapshot().deviceId }
 
     /// The game's runtime switch (configuration.enabled, setEnabled).
@@ -647,8 +780,32 @@ public final class RavensightClient: @unchecked Sendable {
         }
     }
 
-    /// Events currently waiting in the offline queue.
+    /// Called on the main queue after every delivery attempt: each batch
+    /// request, and each failed session open that held queued events back.
+    public var onFlush: ((RavensightFlushOutcome) -> Void)? {
+        get {
+            snapshotLock.lock()
+            defer { snapshotLock.unlock() }
+            return flushHandler
+        }
+        set {
+            snapshotLock.lock()
+            flushHandler = newValue
+            snapshotLock.unlock()
+        }
+    }
+
+    /// Events currently waiting to be sent (queued, not yet delivered).
     public var queuedEventCount: Int { return readSnapshot().queuedEventCount }
+
+    /// Counters for this run: queued (accepted by track), delivered
+    /// (accepted by the server), pending, droppedEvents, restored, and the
+    /// last delivery attempt.
+    public var stats: RavensightStats { return readSnapshot().stats }
+
+    /// The last delivery attempt: accepted, failed(status) or offline, with
+    /// its time. Nil before the first attempt.
+    public var lastDelivery: RavensightDelivery? { return readSnapshot().stats.lastDelivery }
 
     /// Runs a block on the work queue after everything already queued there.
     /// Tests use it as a barrier.
@@ -658,7 +815,7 @@ public final class RavensightClient: @unchecked Sendable {
 
     // MARK: Pump (always on workQueue)
 
-    private func pump(ignoreBackoff: Bool = false) {
+    func pump(ignoreBackoff: Bool = false) {
         guard started, foreground else {
             settleFlushWaiters()
             return
@@ -692,10 +849,44 @@ public final class RavensightClient: @unchecked Sendable {
                         response: response, for: purpose, nowMs: self.now()
                     )
                     self.report(effects)
+                    self.recordDelivery(purpose: purpose, response: response)
                     self.stateChanged()
                     self.pump()
                 }
             }
+        }
+    }
+
+    /// Updates lastDelivery and tells onFlush about a request that carried
+    /// events, or a failed session open that kept them waiting.
+    private func recordDelivery(purpose: RavensightCore.Purpose, response: RavensightResponse) {
+        let carried: Int
+        switch purpose {
+        case .settings:
+            return
+        case .session:
+            guard response.status != 201, core.pendingCount > 0 else { return }
+            carried = 0
+        case .batch(let count), .restored(let count):
+            carried = count
+        case .exit:
+            carried = 1
+        }
+        let result: RavensightDeliveryResult
+        switch response.status {
+        case 202: result = .accepted
+        case 0: result = .offline
+        default: result = .failed(status: response.status)
+        }
+        lastDeliveryRecord = RavensightDelivery(result: result, timestamp: Date(timeIntervalSince1970: Double(now()) / 1000))
+        let outcome = RavensightFlushOutcome(
+            sent: response.status == 202 ? carried : 0,
+            status: response.status,
+            error: response.status == 202 ? nil : response.errorCode(fallback: fallbackCode(response.status)),
+            pending: core.pendingCount
+        )
+        if let handler = onFlush {
+            DispatchQueue.main.async { handler(outcome) }
         }
     }
 
@@ -725,7 +916,7 @@ public final class RavensightClient: @unchecked Sendable {
         }
     }
 
-    private func report(_ effects: [RavensightCore.Effect]) {
+    func report(_ effects: [RavensightCore.Effect]) {
         for effect in effects {
             switch effect {
             case .trackingDisabled:
@@ -757,7 +948,8 @@ public final class RavensightClient: @unchecked Sendable {
 
     /// Call after every state change on the work queue: refreshes the
     /// snapshot, the timer and the status notification.
-    private func stateChanged() {
+    func stateChanged() {
+        persistQueueIfChanged()
         publishSnapshot()
         updateTimer()
         let reason = core.statusReason
@@ -771,18 +963,31 @@ public final class RavensightClient: @unchecked Sendable {
     private func publishSnapshot() {
         let nowMs = now()
         let valid = core.isSessionValid(nowMs: nowMs)
-        let current = Snapshot(
+        let counters = core.stats
+        let stats = RavensightStats(
+            queued: counters.accepted,
+            delivered: counters.sent,
+            pending: counters.pending,
+            droppedEvents: counters.dropped,
+            restored: counters.restored,
+            flushes: counters.flushes,
+            sessions: counters.sessions,
+            lastDelivery: lastDeliveryRecord
+        )
+        snapshotLock.lock()
+        // deviceId is the durable id, set at creation and by resetDeviceId
+        // only, so it is carried over rather than read from the core.
+        snapshot = Snapshot(
             enabled: core.enabled,
             optedOut: core.optedOut,
             trackingEnabled: core.trackingEnabled && core.stopReason == nil,
             sessionReady: valid,
             sessionToken: valid ? core.sessionToken : nil,
-            queuedEventCount: core.pendingEvents.count,
+            queuedEventCount: core.pendingCount,
             reason: core.statusReason,
-            deviceId: core.config.deviceId
+            deviceId: snapshot.deviceId,
+            stats: stats
         )
-        snapshotLock.lock()
-        snapshot = current
         snapshotLock.unlock()
     }
 
@@ -792,18 +997,18 @@ public final class RavensightClient: @unchecked Sendable {
         return snapshot
     }
 
-    private func fallbackCode(_ status: Int) -> String {
+    func fallbackCode(_ status: Int) -> String {
         return status == 0 ? "network_error" : "http_\(status)"
     }
 
-    private func log(_ message: String) {
+    func log(_ message: String) {
         if configuration.verboseLogging {
             print("Ravensight: \(message)")
         }
     }
 
     /// Printed once per run whatever verboseLogging says.
-    private func warnOnce(_ key: String, _ message: String) {
+    func warnOnce(_ key: String, _ message: String) {
         guard !warned.contains(key) else { return }
         warned.insert(key)
         print("Ravensight: \(message)")

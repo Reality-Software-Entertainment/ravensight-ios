@@ -45,13 +45,23 @@ struct RavensightCoreConfig {
     }
 }
 
-/// Counters mirrored from the Unity SDK's RavensightStats.
+/// Counters for one run. accepted counts queue acceptance (what track
+/// returns), sent counts events the server answered 202 for.
 struct RavensightCoreStats {
-    var queued = 0
+    /// Events accepted into the queue this run.
+    var accepted = 0
+    /// Events the server accepted (202) this run.
     var sent = 0
+    /// Events that left the queue without being delivered: pushed out by
+    /// the cap, refused on their own with a 400, or discarded by an
+    /// opt-out, a stop, a reset or the kill switch.
     var dropped = 0
     var flushes = 0
     var sessions = 0
+    /// Events loaded from the persisted queue at launch.
+    var restored = 0
+    /// Events waiting now, restored ones included.
+    var pending = 0
 }
 
 /// The whole Ravensight protocol as a pure, clock injected state machine:
@@ -102,6 +112,9 @@ struct RavensightCore {
         /// under that session's own token. retry is false for the cold
         /// launch marker (one attempt, whatever the answer).
         case exit(retry: Bool)
+        /// Events restored from the persisted queue, sent under the session
+        /// they were queued in while that session is still valid.
+        case restored(count: Int)
     }
 
     /// What the driver should do next.
@@ -127,6 +140,15 @@ struct RavensightCore {
         case keyRefused
         /// Permanent stop for the run (a closed or invalid playtest token).
         case stopped(String)
+    }
+
+    /// Events restored from disk that belong to an earlier, unexpired
+    /// session, sent under that session's token before the live queue.
+    struct RestoredBatch {
+        var sessionToken: String
+        /// Unix milliseconds.
+        var expiresAtMs: Int64
+        var events: [RavensightEvent]
     }
 
     /// A game_exited waiting to go out under a session that has ended.
@@ -167,8 +189,16 @@ struct RavensightCore {
     /// Set when something other than the queue needs a session (feedback).
     private(set) var sessionWanted = false
 
-    private(set) var pendingEvents: [RavensightEvent] = []
+    private(set) var pendingEvents: [RavensightEvent] = [] {
+        didSet { queueRevision &+= 1 }
+    }
+    private(set) var restoredBatch: RestoredBatch? {
+        didSet { queueRevision &+= 1 }
+    }
     private(set) var pendingExit: PendingExit?
+    /// Bumped on every change to the queued events, so a driver that mirrors
+    /// the queue to disk knows when to write.
+    private(set) var queueRevision = 0
 
     private(set) var backoffMs = RavensightCore.defaultRetryMs
     private(set) var nextAttemptAtMs: Int64 = 0
@@ -204,7 +234,7 @@ struct RavensightCore {
             return false
         case .session:
             return sent.session != sessionGeneration
-        case .batch:
+        case .batch, .restored:
             return sent.queue != queueGeneration
         case .exit:
             return sent.exit != pendingExit
@@ -242,8 +272,13 @@ struct RavensightCore {
 
     var stats: RavensightCoreStats {
         var copy = counters
-        copy.queued = pendingEvents.count
+        copy.pending = pendingCount
         return copy
+    }
+
+    /// Events waiting to be sent: the live queue plus any restored batch.
+    var pendingCount: Int {
+        return pendingEvents.count + (restoredBatch?.events.count ?? 0)
     }
 
     func isSessionValid(nowMs: Int64) -> Bool {
@@ -280,7 +315,53 @@ struct RavensightCore {
             data: RavensightCore.sanitizeJSON(data ?? [:]) as? [String: Any] ?? [:],
             timestamp: atSec ?? nowMs / 1000
         ))
+        counters.accepted += 1
         return true
+    }
+
+    /// Puts events loaded from the persisted queue back. Events that were
+    /// queued under a session that is still valid go out under that session
+    /// first; the rest join the front of the live queue and are sent under
+    /// the next session. The cap still applies, oldest dropped first.
+    mutating func restore(
+        events: [RavensightEvent],
+        sessionToken: String?,
+        expiresAtMs: Int64,
+        nowMs: Int64
+    ) {
+        guard canQueue, !events.isEmpty else { return }
+        var kept = events
+        if kept.count > config.maxQueueSize {
+            counters.dropped += kept.count - config.maxQueueSize
+            kept = Array(kept.suffix(config.maxQueueSize))
+        }
+        counters.restored += kept.count
+        if let token = sessionToken, !token.isEmpty,
+           nowMs < expiresAtMs - RavensightCore.sessionExpirySkewMs {
+            if let existing = restoredBatch, existing.sessionToken == token {
+                restoredBatch?.events = existing.events + kept
+            } else {
+                restoredBatch = RestoredBatch(sessionToken: token, expiresAtMs: expiresAtMs, events: kept)
+            }
+        } else {
+            pendingEvents.insert(contentsOf: kept, at: 0)
+            while pendingEvents.count > config.maxQueueSize {
+                pendingEvents.removeFirst()
+                counters.dropped += 1
+            }
+        }
+    }
+
+    /// Moves a restored batch into the front of the live queue (its session
+    /// is gone), keeping the cap.
+    private mutating func demoteRestoredBatch() {
+        guard let batch = restoredBatch else { return }
+        restoredBatch = nil
+        pendingEvents.insert(contentsOf: batch.events, at: 0)
+        while pendingEvents.count > config.maxQueueSize {
+            pendingEvents.removeFirst()
+            counters.dropped += 1
+        }
     }
 
     /// The game's runtime switch. Disabling discards anything queued so an
@@ -335,8 +416,9 @@ struct RavensightCore {
 
     private mutating func discardQueue() {
         queueGeneration += 1
-        counters.dropped += pendingEvents.count
+        counters.dropped += pendingCount
         pendingEvents.removeAll()
+        restoredBatch = nil
         sessionWanted = false
         pendingExit = nil
     }
@@ -367,6 +449,15 @@ struct RavensightCore {
         }
         guard trackingEnabled else { return .idle }
 
+        if let batch = restoredBatch {
+            if !ignoringBackoff && nowMs < nextAttemptAtMs {
+                return .wait(untilMs: nextAttemptAtMs)
+            }
+            let count = min(batchLimit, batch.events.count)
+            let events = batch.events.prefix(count).map { $0.payload() }
+            return .send(eventsRequest(events: events, token: batch.sessionToken), .restored(count: count))
+        }
+
         let hasWork = !pendingEvents.isEmpty || sessionWanted
         guard hasWork else { return .idle }
 
@@ -394,6 +485,8 @@ struct RavensightCore {
             return handleBatch(response, count: count, nowMs: nowMs)
         case .exit(let retry):
             return handleExit(response, retry: retry, nowMs: nowMs)
+        case .restored(let count):
+            return handleRestored(response, count: count, nowMs: nowMs)
         }
     }
 
@@ -531,6 +624,44 @@ struct RavensightCore {
             batchLimit = RavensightCore.maxBatchSize
             return [.eventDropped(response.errorCode(fallback: "http_400"))]
 
+        default:
+            scheduleBackoff(nowMs: nowMs)
+            if response.status == 0 { lastFailure = Reason.offline }
+            return [.flushFailed(response.errorCode(fallback: fallbackCode(for: response.status)))]
+        }
+    }
+
+    private mutating func handleRestored(_ response: RavensightResponse, count: Int, nowMs: Int64) -> [Effect] {
+        guard var batch = restoredBatch else { return [] }
+        switch response.status {
+        case 202:
+            let removed = min(count, batch.events.count)
+            batch.events.removeFirst(removed)
+            restoredBatch = batch.events.isEmpty ? nil : batch
+            counters.sent += removed
+            counters.flushes += 1
+            batchLimit = RavensightCore.maxBatchSize
+            lastFailure = nil
+            resetBackoff()
+            return [.eventsFlushed(removed)]
+        case 401, 400:
+            // The old session is gone (401), or the batch needs splitting
+            // (400): either way the live queue's own handling takes over,
+            // under the current session.
+            demoteRestoredBatch()
+            return []
+        case 403:
+            let code = response.errorCode(fallback: "")
+            if code == "tracking_disabled" || code == "playtest_job_closed" || code == "invalid_playtest_token" {
+                return handleForbidden(response)
+            }
+            // Any other 403 here is about the old session, not the key.
+            demoteRestoredBatch()
+            return []
+        case 429, 503:
+            applyRetryAfter(response, nowMs: nowMs)
+            if response.status == 429 { lastFailure = Reason.rateLimited }
+            return [.flushFailed(response.errorCode(fallback: response.status == 429 ? "rate_limited" : "http_503"))]
         default:
             scheduleBackoff(nowMs: nowMs)
             if response.status == 0 { lastFailure = Reason.offline }

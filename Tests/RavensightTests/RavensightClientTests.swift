@@ -3,12 +3,14 @@ import XCTest
 
 /// A scripted transport: answers requests by URL suffix, records everything.
 /// Completions run synchronously, like an instant network.
-private final class FakeTransport: RavensightTransport {
+final class FakeTransport: RavensightTransport {
     private let lock = NSLock()
     private var recorded: [RavensightRequest] = []
     private var sessionCount = 0
 
     var trackingEnabled = true
+    /// Session tokens are "<prefix>_<n>".
+    var sessionPrefix = "sess"
     var settingsStatus = 200
     var sessionStatus = 201
     var sessionError: String?
@@ -16,6 +18,8 @@ private final class FakeTransport: RavensightTransport {
     var batchError: String?
     /// Requests whose completion is never called (a hung network).
     var hang = false
+    /// Answers a request before the scripted routes, when it returns one.
+    var override: ((RavensightRequest) -> RavensightResponse?)?
     /// Requests to this suffix wait until release(_:) answers them.
     var holdSuffix: String?
     private var held: [(RavensightResponse) -> Void] = []
@@ -71,8 +75,13 @@ private final class FakeTransport: RavensightTransport {
             lock.unlock()
             return
         }
+        let custom = override
         lock.unlock()
         if hung { return }
+        if let custom = custom, let response = custom(request) {
+            completion(response)
+            return
+        }
 
         func json(_ object: [String: Any]) -> Data? {
             return try? JSONSerialization.data(withJSONObject: object)
@@ -87,7 +96,7 @@ private final class FakeTransport: RavensightTransport {
             if sessionStatus == 201 {
                 lock.lock()
                 sessionCount += 1
-                let token = "sess_\(sessionCount)"
+                let token = "\(sessionPrefix)_\(sessionCount)"
                 lock.unlock()
                 completion(RavensightResponse(status: 201, body: json(["token": token, "expiresIn": 86_400])))
             } else {
@@ -111,7 +120,7 @@ private final class FakeTransport: RavensightTransport {
 }
 
 /// A clock the test moves by hand.
-private final class FakeClock {
+final class FakeClock {
     private let lock = NSLock()
     private var current: Int64 = 1_800_000_000_000
 
@@ -698,12 +707,13 @@ final class RavensightClientTests: XCTestCase {
             "RAVENSIGHT_PLAYTEST_RUN_ID": "run_7",
         ])
         XCTAssertTrue(client.isPlaytest)
-        XCTAssertEqual(client.deviceId, "pt-run_7")
-        XCTAssertNil(defaults.string(forKey: RavensightClient.deviceIdKey), "the saved id is never written")
+        XCTAssertTrue(client.isSynthetic)
+        XCTAssertEqual(client.playtestDeviceId, "pt-run_7")
+        XCTAssertEqual(client.deviceId, "", "no durable id yet, and never the synthetic one")
+        XCTAssertNil(defaults.string(forKey: RavensightClient.deviceIdKey), "the saved id is never written at boot")
 
         client.setTrackingEnabled(false)
-        XCTAssertEqual(client.resetDeviceId(), "pt-run_7")
-        XCTAssertTrue(defaults.bool(forKey: RavensightClient.optOutKey), "storage untouched by the no-ops")
+        XCTAssertTrue(defaults.bool(forKey: RavensightClient.optOutKey), "storage untouched by the no-op")
 
         client.start()
         client.track("e")

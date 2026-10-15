@@ -155,20 +155,60 @@ public enum Ravensight {
         return UserDefaults.standard.bool(forKey: RavensightClient.optOutKey)
     }
 
-    /// Forgets this install's analytics identity and returns the new device
-    /// id. See RavensightClient.resetDeviceId. Before start() it saves a
-    /// fresh id for the client to pick up.
+    /// Forgets this install's durable identity and returns the new device
+    /// id, never a synthetic one. See RavensightClient.resetDeviceId. Before
+    /// start() it saves a fresh id for the client to pick up.
     @discardableResult
     public static func resetDeviceId() -> String {
         if let client = shared { return client.resetDeviceId() }
-        if launchedForPlaytest {
-            print("Ravensight: resetDeviceId is ignored during a playtest run")
-            return ""
-        }
         let fresh = RavensightClient.mintDeviceId()
         UserDefaults.standard.set(fresh, forKey: RavensightClient.deviceIdKey)
         UserDefaults.standard.removeObject(forKey: RavensightClient.markerKey)
         return fresh
+    }
+
+    /// Stops everything now, normal and synthetic (playtest) sessions alike:
+    /// timer stopped, queue cleared, track, feedback and reports refused,
+    /// nothing saved. See RavensightClient.stopAllTelemetry. Before start()
+    /// it holds for this process and start() comes up stopped.
+    public static func stopAllTelemetry() {
+        lock.lock()
+        let client = _shared
+        if client == nil { pendingEnabled = false }
+        lock.unlock()
+        client?.stopAllTelemetry()
+    }
+
+    /// Undoes stopAllTelemetry() for this run. A saved player opt-out still
+    /// wins in a normal session.
+    public static func resumeTelemetry() {
+        lock.lock()
+        let client = _shared
+        if client == nil { pendingEnabled = nil }
+        lock.unlock()
+        client?.resumeTelemetry()
+    }
+
+    /// The durable device id, never a synthetic one. Empty before start().
+    public static var deviceId: String {
+        return shared?.deviceId ?? ""
+    }
+
+    /// The id a synthetic (playtest) run sends, pt-<runId>; nil in a normal
+    /// session or before start().
+    public static var playtestDeviceId: String? {
+        return shared?.playtestDeviceId
+    }
+
+    /// True when this run is a synthetic (playtest) session.
+    public static var isSynthetic: Bool {
+        return shared?.isSynthetic ?? false
+    }
+
+    /// Counters for this run (queued, delivered, droppedEvents, lastDelivery).
+    /// Zeros before start().
+    public static var stats: RavensightStats {
+        return shared?.stats ?? RavensightStats()
     }
 
     /// The runtime switch on the shared client, not the player's choice.

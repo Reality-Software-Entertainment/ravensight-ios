@@ -25,6 +25,15 @@ public struct RavensightConfiguration: Sendable {
     /// Offline queue cap. Oldest events are dropped first once exceeded.
     public var maxQueueSize: Int = 500
 
+    /// Keep the queue in a small file under Application Support so events
+    /// survive a force quit or a crash. Off by default: the queue then lives
+    /// in memory only. At most 500 events are written (the newest), every
+    /// write is atomic, the file is read when the client is created, and it
+    /// is deleted when the player opts out, on resetDeviceId, on
+    /// stopAllTelemetry and on the kill switch. Never used in a synthetic
+    /// (playtest) session.
+    public var persistQueue: Bool = false
+
     /// Seconds between automatic flushes. 0 flushes only on demand (and
     /// whenever 50 events are queued, on background and on quit).
     public var flushInterval: TimeInterval = 5
