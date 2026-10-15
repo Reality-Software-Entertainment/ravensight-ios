@@ -778,6 +778,7 @@ struct RavensightCore {
             "deviceId": config.deviceId,
             "gameVersion": config.gameVersion,
             "platform": config.platform,
+            "sdk": "ios/" + RavensightClient.sdkVersion,
         ]
         return RavensightRequest(
             method: "POST",

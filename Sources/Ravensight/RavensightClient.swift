@@ -23,7 +23,7 @@ import UIKit
 /// on the main thread. That is why it is marked @unchecked.
 public final class RavensightClient: @unchecked Sendable {
     /// This SDK's version.
-    public static let sdkVersion = "0.3.1"
+    public static let sdkVersion = "0.4.0"
     /// The default host. "/api/v1" is appended for you.
     public static let defaultApiUrl = RavensightCore.defaultApiUrl
     /// Server hard limit on POST /track/batch.
@@ -71,6 +71,13 @@ public final class RavensightClient: @unchecked Sendable {
     private var flushWaiters: [Waiter] = []
     /// Created and read on the main thread only.
     private var lifecycle: RavensightLifecycle?
+    /// Opt-in per-session performance sampling (configuration.performance).
+    let healthSampler = RavensightHealthSampler()
+    private var healthSent = false
+    private var bootMs: Double?
+    #if canImport(UIKit) && !os(watchOS)
+    private var frameHook: RavensightFrameHook?
+    #endif
     private var warned: Set<String> = []
     private var lastNotifiedReason: String?
 
@@ -333,6 +340,7 @@ public final class RavensightClient: @unchecked Sendable {
     /// foreground. Safe to call once; later calls are ignored.
     public func start() {
         let background = isBackgroundLaunch()
+        if configuration.performance { bootMs = RavensightHealthSampler.msSinceProcessStart() }
         workQueue.async {
             guard !self.started else { return }
             self.started = true
@@ -367,6 +375,11 @@ public final class RavensightClient: @unchecked Sendable {
     private func installLifecycleHooks() {
         guard lifecycle == nil else { return }
         lifecycle = RavensightLifecycle(client: self)
+        #if canImport(UIKit) && !os(watchOS)
+        if configuration.performance && frameHook == nil {
+            frameHook = RavensightFrameHook(sampler: healthSampler)
+        }
+        #endif
         if !isBackgroundLaunch() && RavensightClient.applicationIsActive() {
             handleDidBecomeActive()
         }
@@ -415,11 +428,26 @@ public final class RavensightClient: @unchecked Sendable {
                 self.writeBackgroundMarker()
                 self.stateChanged()
             }
+            self.queueHealthIfDue()
             self.persistQueueIfChanged(immediate: true)
             if let completion = completion {
                 self.flushWaiters.append(Waiter(callback: completion, onMain: false))
             }
             self.pump()
+        }
+    }
+
+    /// Queues the one health event of this session, when performance
+    /// sampling is on and at least one sample exists. Work queue only.
+    /// Nothing is sent per second or from the frame hook.
+    func queueHealthIfDue() {
+        guard configuration.performance, !healthSent, let summary = healthSampler.summary() else { return }
+        let built = RavensightTypedEvents.health(
+            fpsMedian: summary.median, fpsP10: summary.p10,
+            memoryMb: RavensightHealthSampler.memoryMb(), bootMs: bootMs)
+        if core.track(name: built.name, data: built.data, nowMs: now()) {
+            healthSent = true
+            stateChanged()
         }
     }
 
@@ -450,6 +478,7 @@ public final class RavensightClient: @unchecked Sendable {
                 }
                 self.core.invalidateSession()
                 self.startedQueued = false
+                self.healthSent = false
                 self.queueGameStartedIfDue()
                 self.stateChanged()
                 self.pump()

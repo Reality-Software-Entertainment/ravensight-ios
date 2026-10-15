@@ -9,6 +9,14 @@ All notable changes to this package are documented here.
 - [docs/XCODE_SETUP.md](docs/XCODE_SETUP.md): separate development and production ingest keys through xcconfig files and an explicit Info.plist template, reading the key at startup, suppressing telemetry under XCTest and SwiftUI previews, and checking the built bundle (proven on Xcode 27.0).
 - A "Timing and privacy" note in the narrative sample section and its `QUERIES.md`: an app that reads `ProcessInfo.systemUptime` for its own clock needs its own privacy manifest entry, and should send elapsed in-app intervals, never raw uptime.
 
+## [0.4.0] - 2026-10-15
+
+### Added
+
+- Typed event helpers over `Ravensight.track`: `trackPurchase` (an `Int` or digit `String` amount), `trackResource`, `trackProgression` and `trackError`. They set the reserved `rs_*` properties, upper-case the currency, cut an error message to 200 characters and a stack to 2000, let the reserved keys win over `extra:`, and accept a `name:` override.
+- Opt-in `performance` configuration flag. On iOS a `CADisplayLink` samples the frame rate once a second (at most 600 samples), and one `health` event per session (`rs_fps_median`, `rs_fps_p10`, `rs_memory_mb`, `rs_boot_ms`) is sent on `didEnterBackground`. Nothing is sent without samples. A no-op on macOS.
+- The session request now carries `"sdk": "ios/<version>"`.
+
 ## [0.3.1] - 2026-10-15
 
 ### Fixed
