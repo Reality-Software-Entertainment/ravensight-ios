@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(UIKit) && !os(watchOS)
+import UIKit
+#endif
 
 /// The static facade most games use. Call start once, early, then track from
 /// anywhere:
@@ -118,6 +121,73 @@ public enum Ravensight {
         }
         client.submitFeedback(message, category: category, rating: rating, completion: completion)
     }
+
+    /// Submits a Player Report (text, metadata, optional screenshot). See
+    /// RavensightClient.submitReport(_:completion:) for the steps, usage,
+    /// retry rules and error codes. Resubmit the same value to retry.
+    public static func submitReport(
+        _ report: RavensightReport,
+        completion: ((Result<RavensightReportReceipt, RavensightError>) -> Void)? = nil
+    ) {
+        guard let client = shared else {
+            if let completion = completion {
+                DispatchQueue.main.async {
+                    completion(.failure(RavensightError(
+                        code: "not_started", status: 0,
+                        message: "call Ravensight.start before submitting a report"
+                    )))
+                }
+            }
+            return
+        }
+        client.submitReport(report, completion: completion)
+    }
+
+    /// Text and metadata with optional JPEG, PNG or WebP screenshot bytes.
+    /// Returns the report so a failure can be retried with submitReport(_:).
+    @discardableResult
+    public static func submitReport(
+        category: String = "other",
+        message: String,
+        screenshotData: Data?,
+        metadata: [String: RavensightMetadataValue] = [:],
+        completion: ((Result<RavensightReportReceipt, RavensightError>) -> Void)? = nil
+    ) -> RavensightReport {
+        let report = RavensightReport(category: category, message: message, screenshotData: screenshotData, metadata: metadata)
+        submitReport(report, completion: completion)
+        return report
+    }
+
+    #if canImport(UIKit) && !os(watchOS)
+    /// Text and metadata with an optional screenshot the game captured. The
+    /// SDK never captures the screen itself. Returns the report so a failure
+    /// can be retried with submitReport(_:).
+    @discardableResult
+    public static func submitReport(
+        category: String = "other",
+        message: String,
+        screenshot: UIImage? = nil,
+        metadata: [String: RavensightMetadataValue] = [:],
+        completion: ((Result<RavensightReportReceipt, RavensightError>) -> Void)? = nil
+    ) -> RavensightReport {
+        let report = RavensightReport(category: category, message: message, screenshot: screenshot, metadata: metadata)
+        submitReport(report, completion: completion)
+        return report
+    }
+    #else
+    /// A text report (no UIKit here: pass screenshotData for an image).
+    @discardableResult
+    public static func submitReport(
+        category: String = "other",
+        message: String,
+        metadata: [String: RavensightMetadataValue] = [:],
+        completion: ((Result<RavensightReportReceipt, RavensightError>) -> Void)? = nil
+    ) -> RavensightReport {
+        let report = RavensightReport(category: category, message: message, metadata: metadata)
+        submitReport(report, completion: completion)
+        return report
+    }
+    #endif
 
     /// EXPERIMENTAL. AI generated design suggestions for your game. An
     /// empty list while tracking is off.

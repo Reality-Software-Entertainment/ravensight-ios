@@ -822,6 +822,19 @@ struct RavensightCore {
         )
     }
 
+    /// A Player Reports request (POST /reports, /reports/:id/upload,
+    /// /reports/:id/finalize, GET /reports/:id) under the session token.
+    func reportRequest(method: String, path: String, body: [String: Any]?, token: String) -> RavensightRequest {
+        var headers = ["X-Session-Token": token]
+        if body != nil { headers["Content-Type"] = "application/json" }
+        return RavensightRequest(
+            method: method,
+            url: config.apiUrl + "/reports" + path,
+            headers: withPlaytest(headers),
+            body: body.map { RavensightCore.encodeJSON($0) }
+        )
+    }
+
     func suggestionsRequest() -> RavensightRequest {
         return RavensightRequest(
             method: "GET",
