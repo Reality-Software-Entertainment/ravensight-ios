@@ -30,7 +30,8 @@ From the feedback of a native SwiftUI game on 0.2.0.
   bounded file under Application Support (at most 500 events, atomic
   writes, read at creation, deleted on opt-out, stop, reset and the kill
   switch, never used by a synthetic session). Restored events go out under
-  the session they were queued in while it is still valid.
+  the session they were queued in while it is still valid. Reads and
+  coalesced writes happen on the SDK's work queue.
 * `stats` (`RavensightStats`: `queued`, `delivered`, `pending`,
   `droppedEvents`, `restored`, `flushes`, `sessions`, `lastDelivery`),
   `lastDelivery` (`accepted`, `failed(status:)`, `offline`, with a
@@ -40,9 +41,11 @@ From the feedback of a native SwiftUI game on 0.2.0.
   (a `UIImage` on iOS, `screenshotData:` bytes anywhere) and
   `submitReport(_ report:)` for a retry. It follows the server's report
   routes: `POST /reports`, then for a screenshot the upload form, the
-  upload to report storage, finalize and status checks. Limits are checked
-  on the device first. One attempt per step, no automatic retry; the same
-  `RavensightReport` value resubmits the same submission. Refused with
+  upload to report storage, finalize and at most 35 status checks. Limits
+  are checked on the device first. One attempt per step, no automatic
+  retry; the same `RavensightReport` value is the same submission only
+  within the same session (a new session is a new, separately charged
+  submission). Refused with
   `disabled` while tracking is off. A screenshot is only sent when the game
   passes one.
 * `Examples/NarrativeSample`: run and encounter ids, a monotonic foreground

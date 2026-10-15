@@ -43,7 +43,7 @@ final class RavensightControlTests: XCTestCase {
         configuration.flushInterval = 0
         configure(&configuration)
         let clock = self.clock
-        return RavensightClient(
+        let client = RavensightClient(
             configuration: configuration,
             transport: transport,
             now: { clock.nowMs },
@@ -53,7 +53,17 @@ final class RavensightControlTests: XCTestCase {
             installsLifecycleObservers: false,
             queueDirectory: queueDirectory
         )
+        client.persistDelay = persistDelay
+        // The file is read on the work queue; wait for it like a caller of
+        // the public properties would see it settle.
+        let loaded = expectation(description: "loaded")
+        client.onWorkQueue { loaded.fulfill() }
+        wait(for: [loaded], timeout: 2)
+        return client
     }
+
+    /// Writes immediately unless a test is about the coalescing itself.
+    private var persistDelay: TimeInterval = 0
 
     private func settle(_ client: RavensightClient) {
         for _ in 0..<25 {
@@ -397,7 +407,10 @@ final class RavensightControlTests: XCTestCase {
         XCTAssertTrue(queueFiles.isEmpty)
     }
 
-    func testAClientBuiltDisabledLoadsTheQueueWhenEnabled() {
+    /// The game's own switch turned on later in the run (a consent screen
+    /// answered yes): the earlier launch's events are loaded then. A stop
+    /// or opt-out before that deletes them instead (next two tests).
+    func testAClientBuiltDisabledThenEnabledLoadsTheQueue() {
         let first = makeClient(transport: FakeTransport()) { $0.persistQueue = true }
         first.track("kept")
         settle(first)
@@ -413,6 +426,122 @@ final class RavensightControlTests: XCTestCase {
         second.setEnabled(true)
         flushAndWait(second)
         XCTAssertEqual(transport.sentEvents().map { $0.name }, ["kept"])
+    }
+
+    func testAStopBeforeStartDeletesAQueueStillWaitingToLoad() {
+        let first = makeClient(transport: FakeTransport()) { $0.persistQueue = true }
+        first.track("previous_process")
+        settle(first)
+
+        let transport = FakeTransport()
+        let second = makeClient(transport: transport) {
+            $0.persistQueue = true
+            $0.enabled = false
+        }
+        second.stopAllTelemetry()
+        settle(second)
+        XCTAssertTrue(queueFiles.isEmpty, "a stop keeps nothing")
+        second.start()
+        second.resumeTelemetry()
+        flushAndWait(second)
+        XCTAssertTrue(transport.sentEvents().isEmpty, "the previous process's events are never sent")
+        XCTAssertEqual(second.stats.restored, 0)
+    }
+
+    func testAnOptOutBeforeStartDeletesAQueueStillWaitingToLoad() {
+        let first = makeClient(transport: FakeTransport()) { $0.persistQueue = true }
+        first.track("previous_process")
+        settle(first)
+
+        let transport = FakeTransport()
+        let second = makeClient(transport: transport) {
+            $0.persistQueue = true
+            $0.enabled = false
+        }
+        second.setTrackingEnabled(false)
+        settle(second)
+        XCTAssertTrue(queueFiles.isEmpty)
+        second.setTrackingEnabled(true)
+        second.start()
+        second.setEnabled(true)
+        flushAndWait(second)
+        XCTAssertTrue(transport.sentEvents().isEmpty)
+    }
+
+    func testResetDeletesTheOldIdentitysQueueFileInEveryPath() {
+        // Normal session, with the file still waiting to load.
+        let first = makeClient(transport: FakeTransport()) { $0.persistQueue = true }
+        first.track("old_identity")
+        settle(first)
+        let disabled = makeClient(transport: FakeTransport()) {
+            $0.persistQueue = true
+            $0.enabled = false
+        }
+        disabled.resetDeviceId()
+        settle(disabled)
+        XCTAssertTrue(queueFiles.isEmpty)
+
+        // Synthetic session: the file a normal launch left behind goes too.
+        let again = makeClient(transport: FakeTransport()) { $0.persistQueue = true }
+        again.track("old_identity")
+        settle(again)
+        XCTAssertFalse(queueFiles.isEmpty)
+        let playtest = makeClient(transport: FakeTransport(), environment: playtestEnvironment) {
+            $0.persistQueue = true
+        }
+        XCTAssertFalse(queueFiles.isEmpty, "a synthetic run leaves it alone until a reset")
+        playtest.resetDeviceId()
+        settle(playtest)
+        XCTAssertTrue(queueFiles.isEmpty)
+    }
+
+    func testDeleteAllRemovesEveryQueueFileBeforeStart() throws {
+        try FileManager.default.createDirectory(at: queueDirectory, withIntermediateDirectories: true)
+        let keep = queueDirectory.appendingPathComponent("unrelated.txt")
+        try Data("x".utf8).write(to: keep)
+        for key in ["gt_live_a", "gt_live_b"] {
+            let url = RavensightQueueStore.defaultFileURL(ingestKey: key, directory: queueDirectory)!
+            try Data("{}".utf8).write(to: url)
+        }
+        RavensightQueueStore.deleteAll(directory: queueDirectory)
+        XCTAssertEqual(queueFiles.map { $0.lastPathComponent }, ["unrelated.txt"])
+    }
+
+    func testWritesAreCoalescedAndBackgroundWritesAtOnce() {
+        persistDelay = 0.25
+        let client = makeClient(transport: FakeTransport()) { $0.persistQueue = true }
+        for index in 0..<5 { client.track("e\(index)") }
+        settle(client)
+        XCTAssertEqual(client.queueWrites, 0, "not yet: the burst is still being coalesced")
+        let written = expectation(description: "coalesced write")
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) { written.fulfill() }
+        wait(for: [written], timeout: 2)
+        settle(client)
+        XCTAssertEqual(client.queueWrites, 1)
+        XCTAssertEqual(savedEventNames().count, 5)
+
+        client.track("before_background")
+        client.handleDidEnterBackground()
+        settle(client)
+        XCTAssertEqual(savedEventNames().last, "before_background", "background writes without waiting")
+    }
+
+    func testEventsTooOldToRestoreCountAsDropped() throws {
+        try FileManager.default.createDirectory(at: queueDirectory, withIntermediateDirectories: true)
+        let url = RavensightQueueStore.defaultFileURL(ingestKey: "gt_live_test", directory: queueDirectory)!
+        let nowSec = clock.nowMs / 1000
+        let file: [String: Any] = ["version": 1, "groups": [[
+            "expiresAtMs": 0,
+            "events": [
+                ["event": "ancient", "data": [:], "timestamp": nowSec - 100 * 86_400],
+                ["event": "recent", "data": [:], "timestamp": nowSec - 60],
+            ],
+        ]]]
+        try JSONSerialization.data(withJSONObject: file).write(to: url)
+        let client = makeClient(transport: FakeTransport()) { $0.persistQueue = true }
+        XCTAssertEqual(client.stats.restored, 1)
+        XCTAssertEqual(client.stats.droppedEvents, 1)
+        XCTAssertEqual(client.stats.queued, 0, "restored events were queued by an earlier launch")
     }
 
     func testASyntheticSessionNeverPersists() {

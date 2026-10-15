@@ -42,12 +42,16 @@ public enum RavensightMetadataValue: Equatable, Sendable,
     }
 }
 
-/// One player report, built once and safe to submit again. The submission
-/// id (clientId), the capture time and the screenshot bytes are fixed when
-/// the value is created, so resubmitting the same value after a failure is
-/// recognised by the server as the same report: it is never stored or
-/// charged twice. A different message under the same clientId is refused
-/// with submission_conflict.
+/// One player report, built once. The submission id (clientId), the capture
+/// time and the screenshot bytes are fixed when the value is created.
+///
+/// The server deduplicates a submission by clientId within one session
+/// only. Resubmitting the same value under the same session token is the
+/// same submission. Under a different session (after a 401, a session
+/// timeout, resetDeviceId or a relaunch) the server sees a new submission:
+/// it is stored again and a screenshot reserves another 20,001 usage
+/// events. A different message under the same clientId in the same session
+/// is refused with submission_conflict.
 public struct RavensightReport: Sendable {
     /// The idempotency key the server deduplicates on (32 hex characters).
     public let clientId: String
@@ -131,7 +135,8 @@ public struct RavensightReport: Sendable {
     /// Scales to fit 1600 by 1600 (the size the server keeps) and encodes
     /// JPEG under the 1,000,000 byte limit, or nil if it cannot.
     static func encodeScreenshot(_ image: UIImage) -> Data? {
-        let size = image.size
+        // Pixels, not points: a @3x screenshot keeps its full resolution.
+        let size = CGSize(width: image.size.width * image.scale, height: image.size.height * image.scale)
         guard size.width > 0, size.height > 0 else { return nil }
         for (side, quality) in [(1600.0, 0.78), (1600.0, 0.6), (1200.0, 0.6), (800.0, 0.6)] {
             let scale = min(1, side / max(size.width, size.height))
@@ -282,13 +287,19 @@ extension RavensightClient {
     /// 20,000, reserved when the report is accepted.
     ///
     /// Retries: the SDK makes one attempt per step and never retries on its
-    /// own, because a screenshot reserves usage. On failure the error code
-    /// says what happened; submit the same RavensightReport value again to
-    /// retry (same clientId, capture time and bytes), and the server picks
-    /// up where it stopped instead of creating a second report. The server
-    /// allows two upload attempts per report, and releases an unfinished
-    /// screenshot report's reservation after 15 minutes. A retry after a
-    /// day fails with invalid_capture_time; build a new report then.
+    /// own, because a screenshot reserves usage. The safe retry is the same
+    /// RavensightReport value under the same session (sessionToken
+    /// unchanged since the failed attempt): the server finds the existing
+    /// submission and the SDK carries on from where it stopped. A retry
+    /// under a different session is a new submission and, with a
+    /// screenshot, reserves usage again. The server allows two upload
+    /// attempts per submission, and releases an unfinished screenshot
+    /// submission's reservation after 15 minutes. A retry after a day fails
+    /// with invalid_capture_time.
+    ///
+    /// Status checks: after finalize the SDK checks every 2 seconds, at most
+    /// 35 times (about 70 seconds). Only stopAllTelemetry, an opt-out or the
+    /// kill switch ends them sooner, with "disabled".
     ///
     /// Refused locally, with no request, while tracking is off (opted out,
     /// stopped, disabled, kill switch): "disabled". Other local codes:

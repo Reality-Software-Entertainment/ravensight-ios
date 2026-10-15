@@ -76,6 +76,16 @@ public final class RavensightClient: @unchecked Sendable {
 
     /// The persisted queue, nil unless persistQueue is on in a normal session.
     private let queueStore: RavensightQueueStore?
+    /// Where this key's queue file lives (or would), whatever persistQueue
+    /// says, so an opt-out or a reset can delete one left by an earlier
+    /// launch.
+    private let queueFileURL: URL?
+    /// Seconds a queue write waits so a burst of changes becomes one write.
+    /// Background, quit and anything that empties the queue write at once.
+    var persistDelay: TimeInterval = 0.25
+    private var persistScheduled = false
+    /// Queue file writes this run. Tests read it.
+    private(set) var queueWrites = 0
     /// True while the saved queue is still on disk waiting to be loaded (the
     /// client was built disabled).
     private var restoreDue = false
@@ -168,10 +178,11 @@ public final class RavensightClient: @unchecked Sendable {
             optedOut = defaults.bool(forKey: RavensightClient.optOutKey)
             self.playtestDeviceId = nil
         }
+        self.queueFileURL = RavensightQueueStore.defaultFileURL(
+            ingestKey: configuration.ingestKey, directory: queueDirectory
+        )
         if configuration.persistQueue && token == nil {
-            self.queueStore = RavensightQueueStore.defaultFileURL(
-                ingestKey: configuration.ingestKey, directory: queueDirectory
-            ).map(RavensightQueueStore.init(fileURL:))
+            self.queueStore = queueFileURL.map(RavensightQueueStore.init(fileURL:))
         } else {
             self.queueStore = nil
         }
@@ -194,15 +205,6 @@ public final class RavensightClient: @unchecked Sendable {
         }
         self.core = core
         self.snapshot.deviceId = durableId
-        if let store = queueStore {
-            if optedOut {
-                // The player said no: nothing they queued earlier is kept.
-                store.delete()
-            } else {
-                restoreDue = true
-                restoreQueueIfDue()
-            }
-        }
         self.persistedRevision = self.core.queueRevision
         self.lastNotifiedReason = self.core.statusReason
         if token != nil && runId == nil {
@@ -212,6 +214,24 @@ public final class RavensightClient: @unchecked Sendable {
             )
         }
         publishSnapshot()
+
+        // File work happens on the work queue, never on the caller's thread
+        // (start() may hold the facade's lock while this runs).
+        let persist = configuration.persistQueue
+        let synthetic = token != nil
+        workQueue.async {
+            if synthetic { return } // a synthetic run never touches the file
+            if optedOut || !persist {
+                // The player said no, or the game no longer persists: an
+                // earlier launch's events are not kept.
+                self.deleteQueueFile()
+                return
+            }
+            self.restoreDue = true
+            self.restoreQueueIfDue()
+            self.persistedRevision = self.core.queueRevision
+            self.stateChanged()
+        }
     }
 
     deinit {
@@ -225,7 +245,9 @@ public final class RavensightClient: @unchecked Sendable {
         guard restoreDue, let store = queueStore, core.canQueue else { return }
         restoreDue = false
         let nowMs = now()
-        for group in store.load(nowMs: nowMs) {
+        let loaded = store.load(nowMs: nowMs)
+        if loaded.dropped > 0 { core.countDropped(loaded.dropped) }
+        for group in loaded.groups {
             core.restore(
                 events: group.events,
                 sessionToken: group.sessionToken,
@@ -238,9 +260,36 @@ public final class RavensightClient: @unchecked Sendable {
         }
     }
 
+    /// Deletes this key's queue file and forgets any load still due. Work
+    /// queue only.
+    private func deleteQueueFile() {
+        restoreDue = false
+        persistScheduled = false
+        if let url = queueFileURL { try? FileManager.default.removeItem(at: url) }
+        persistedRevision = core.queueRevision
+        persistedSessionToken = nil
+    }
+
     /// Mirrors the queue to disk when it, or the session it would be sent
-    /// under, changed. Work queue only.
-    private func persistQueueIfChanged() {
+    /// under, changed: at once when the queue is empty (the file is deleted)
+    /// or immediate is set, otherwise coalesced over persistDelay. Work queue
+    /// only.
+    private func persistQueueIfChanged(immediate: Bool = false) {
+        guard queueStore != nil, !restoreDue else { return }
+        if immediate || core.pendingCount == 0 || persistDelay <= 0 {
+            writeQueueNow()
+            return
+        }
+        guard !persistScheduled else { return }
+        persistScheduled = true
+        workQueue.asyncAfter(deadline: .now() + persistDelay) {
+            guard self.persistScheduled else { return }
+            self.writeQueueNow()
+        }
+    }
+
+    private func writeQueueNow() {
+        persistScheduled = false
         guard let store = queueStore, !restoreDue else { return }
         let valid = core.isSessionValid(nowMs: now())
         let token = valid ? core.sessionToken : nil
@@ -256,6 +305,7 @@ public final class RavensightClient: @unchecked Sendable {
             expiresAtMs: valid ? core.sessionExpiresAtMs : 0,
             events: core.pendingEvents
         ))
+        queueWrites += 1
         if !store.save(groups) {
             warnOnce("queue_write", "could not write the persisted queue; events stay in memory.")
         }
@@ -352,6 +402,7 @@ public final class RavensightClient: @unchecked Sendable {
                 self.writeBackgroundMarker()
                 self.stateChanged()
             }
+            self.persistQueueIfChanged(immediate: true)
             if let completion = completion {
                 self.flushWaiters.append(Waiter(callback: completion, onMain: false))
             }
@@ -434,6 +485,7 @@ public final class RavensightClient: @unchecked Sendable {
                 }
                 self.stateChanged()
             }
+            self.persistQueueIfChanged(immediate: true)
             self.flushWaiters.append(Waiter(callback: { done.signal() }, onMain: false))
             // The last chance skips any backoff window, but a refused key
             // stays refused: the quit is not an explicit flush.
@@ -660,6 +712,7 @@ public final class RavensightClient: @unchecked Sendable {
         snapshotLock.unlock()
         workQueue.async {
             self.core.setOptedOut(!enabled)
+            if !enabled { self.deleteQueueFile() }
             if enabled { self.queueGameStartedIfDue() }
             self.stateChanged()
             if enabled { self.pump() }
@@ -679,6 +732,10 @@ public final class RavensightClient: @unchecked Sendable {
             if enabled {
                 self.restoreQueueIfDue()
                 self.queueGameStartedIfDue()
+            } else {
+                // A stop keeps nothing, including a file still waiting to
+                // be loaded by a client built disabled.
+                self.deleteQueueFile()
             }
             self.stateChanged()
             if enabled { self.pump() }
@@ -724,10 +781,13 @@ public final class RavensightClient: @unchecked Sendable {
         snapshotLock.unlock()
         if isPlaytest {
             print("Ravensight: resetDeviceId saved a new durable id for the next normal launch; this synthetic run keeps its playtest id")
+            // Events a normal launch left on disk belong to the forgotten id.
+            workQueue.async { self.deleteQueueFile() }
             return fresh
         }
         workQueue.async {
             self.core.replaceDeviceId(fresh)
+            self.deleteQueueFile()
             self.stateChanged()
         }
         return fresh

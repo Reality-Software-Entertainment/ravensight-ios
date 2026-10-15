@@ -232,6 +232,8 @@ public enum Ravensight {
     public static func resetDeviceId() -> String {
         if let client = shared { return client.resetDeviceId() }
         let fresh = RavensightClient.mintDeviceId()
+        // Queued events on disk belong to the forgotten id.
+        RavensightQueueStore.deleteAll()
         UserDefaults.standard.set(fresh, forKey: RavensightClient.deviceIdKey)
         UserDefaults.standard.removeObject(forKey: RavensightClient.markerKey)
         return fresh

@@ -17,23 +17,30 @@ dependencies.
 
 What has been run, and what has not:
 
-* `swift build` and `swift test` on macOS (Swift 6.4, Xcode 27.0): 119
+* `swift build` and `swift test` on macOS (Swift 6.4, Xcode 27.0): 125
   tests, the protocol core with a fake clock and the client with a fake
   transport, a fake clock, an isolated `UserDefaults` suite and a temporary
   queue directory.
 * `xcodebuild test` on the iOS Simulator (iPhone 17, iOS 27.0, Xcode 27.0):
-  120 tests, the same 119 plus the `UIImage` screenshot encoding test,
-  which only builds where UIKit exists.
+  128 tests, the same 125 plus three `UIImage` screenshot encoding tests
+  (size limit, Retina pixels kept, scaled to fit 1600 pixels), which only
+  build where UIKit exists.
 * `Examples/NarrativeSample`: `swift build` and `swift test` on macOS (8
   tests), and its tests under `xcodebuild test` on the same iOS Simulator.
   The SwiftUI executable has been built on macOS, not launched against a
-  live server.
+  live server. The queries in its `QUERIES.md` were run against a local
+  ClickHouse with the events table's schema and a small hand made dataset,
+  not against production data.
 * Player Reports were tested against a stub transport that answers the way
   the server's report routes do (`src/routes/v1/playerReports.js`). A
   real upload to report storage has not been run from this SDK.
-* The 0.2.0 release was also built from a Swift 6 language mode app (tools
-  version 6.0) with no diagnostics; that check has not been repeated for
-  0.3.0. The lifecycle tests call the client's handlers
+* The package builds in Swift 5 language mode (tools version 5.9). Its
+  thread safety is by design, not proven by the compiler: the client is
+  `@unchecked Sendable`, and the state added in 0.3.0 (the persisted queue,
+  the delivery counters, the report steps) lives on the client's serial
+  work queue and under its snapshot lock, like the rest. The 0.2.0 release
+  was built from a Swift 6 language mode app with no diagnostics; that has
+  not been repeated for 0.3.0. The lifecycle tests call the client's handlers
   directly; the UIKit notifications that drive them in an app, the
   background task assertion and a real swipe from the app switcher have not
   been exercised.
@@ -386,7 +393,10 @@ separate fact, reported three ways:
   cap, a `400` on a single event, or discarded by an opt-out,
   `stopAllTelemetry`, `resetDeviceId`, the kill switch or a playtest stop),
   `restored` (loaded from the persisted queue), `flushes`, `sessions` and
-  `lastDelivery`.
+  `lastDelivery`. Restored events were queued by an earlier launch, so they
+  count in `restored` and, once sent, in `delivered`, but not in `queued`.
+  Restored events older than 89 days, or beyond the file's 500, count in
+  `droppedEvents`.
 * `client.lastDelivery`: `.accepted`, `.failed(status:)` or `.offline`,
   with the time it happened.
 * `client.onFlush`: called on the main queue with a
@@ -411,14 +421,20 @@ Application Support (`Ravensight/queue-<key hash>.json`, excluded from
 backups):
 
 * at most 500 events, the newest, whatever `maxQueueSize` says;
-* every write is atomic (a temporary file renamed over the old one), and
-  happens whenever the queue changes;
-* the file is read when the client is created; events from it go out under
+* every write is atomic (a temporary file renamed over the old one);
+* the file is read on the SDK's work queue right after the client is
+  created, and each write is coalesced over a quarter of a second (a
+  background, a quit and anything that empties the queue write at once);
+  events from it go out under
   the session they were queued in while that session is still valid, and
   otherwise under the next session, with their original timestamps;
 * it is deleted when the player opts out (also at launch, when a saved
-  opt-out is found), on `stopAllTelemetry`, on `resetDeviceId`, on the
-  kill switch and when the queue drains;
+  opt-out is found), on `stopAllTelemetry`, on `resetDeviceId` (before
+  `start()` too, where every queue file is removed), on the kill switch,
+  when the queue drains, and at launch when `persistQueue` is off. A client
+  built with `enabled = false` leaves the file until it is enabled (then
+  loads it) or stopped or opted out (then deletes it), so a stop before
+  `start()` never lets `resumeTelemetry()` send an earlier launch's events;
 * a synthetic (playtest) session never reads or writes it;
 * events older than 89 days are not restored (the server ignores events
   older than 90 days).
@@ -446,14 +462,21 @@ let report = Ravensight.submitReport(
     switch result {
     case .success(let receipt):
         print("report \(receipt.reportId ?? receipt.id) saved")
-    case .failure(let error) where error.code == "upload_failed" || error.status == 0:
-        // Safe to retry: the same value is the same submission.
-        pendingReport = report
+    case .failure(let error)
+        where ["upload_failed", "report_processing"].contains(error.code) || error.status == 0:
+        // Retry later, but only under the session it was submitted in.
+        pendingReport = (report, Ravensight.sessionToken)
     case .failure(let error):
         print("report refused: \(error.code)")
     }
 }
-// Later: Ravensight.submitReport(pendingReport) { ... }
+
+// Later, for example from a "Try again" button:
+if let pending = pendingReport, let session = pending.1, session == Ravensight.sessionToken {
+    Ravensight.submitReport(pending.0) { _ in }   // the same submission
+} else {
+    pendingReport = nil   // the session changed: a resubmission would be a new, separately charged report
+}
 ```
 
 On macOS (no UIKit) pass `screenshotData:` with JPEG, PNG or WebP bytes,
@@ -467,8 +490,10 @@ complete on that one request. A screenshot report then asks
 `POST /reports/:id/upload` for a one-time upload form, uploads the bytes to
 report storage as `multipart/form-data` (no key, session token or playtest
 header goes to storage), calls `POST /reports/:id/finalize`, and checks
-`GET /reports/:id` every 2 seconds until the server has processed the image
-(up to 35 checks).
+`GET /reports/:id` every 2 seconds until the server has processed the image.
+The checks are bounded: at most 35 (about 70 seconds), then the report
+fails with `report_processing`. Only `stopAllTelemetry`, an opt-out or the
+kill switch ends them sooner, with `disabled`.
 
 Limits, checked on the device before any request (the server checks them
 again): a message of 1 to 500 characters; a category from
@@ -484,12 +509,20 @@ Usage: a text report draws one shared usage event. A screenshot adds
 
 Retries: the SDK makes one attempt per step and never retries a report on
 its own, because a screenshot reserves usage. The `RavensightReport` value
-fixes the `clientId`, the capture time and the screenshot bytes, so
-submitting the same value again is the same submission: the server returns
-the existing one and the SDK carries on from where it stopped. The server
-allows two upload attempts per report and releases an unfinished
-screenshot report after 15 minutes. A different message under the same
-`clientId` is refused with `submission_conflict`.
+fixes the `clientId`, the capture time and the screenshot bytes. The server
+deduplicates a submission by `clientId` **within one session only**:
+
+* Same value, same session token: the same submission. The server returns
+  it and the SDK carries on from where it stopped. This is the only safe
+  retry, and what the example above checks.
+* Same value after the session changed (a `401`, the session timing out,
+  `resetDeviceId`, a relaunch): the server sees a new submission. It is
+  stored again, and a screenshot reserves another 20,001 usage events.
+
+The server allows two upload attempts per submission and releases an
+unfinished screenshot submission's reservation after 15 minutes. A
+different message under the same `clientId` in the same session is refused
+with `submission_conflict`.
 
 Refusals: `disabled` while tracking is off (opted out, stopped, disabled or
 switched off by the server), with no request. Local: `empty_message`,
@@ -582,7 +615,9 @@ and return immediately. The read only properties (`isReady`,
 `isTrackingEnabled`, `isEnabled`, `isOptedOut`, `statusReason`,
 `sessionToken`, `deviceId`, `queuedEventCount`) read a lock protected
 snapshot and never wait on network work. Completion handlers and
-`onStatusChange` are always delivered on the main queue. The SDK never
+`onStatusChange` are always delivered on the main queue. This is a design
+contract, not a compiler proof: the package is built in Swift 5 language
+mode and the client is `@unchecked Sendable`. The SDK never
 throws into game code. The one place it blocks is the quit path, for at most
 1.5 seconds.
 

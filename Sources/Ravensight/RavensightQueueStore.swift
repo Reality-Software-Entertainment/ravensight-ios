@@ -58,11 +58,12 @@ final class RavensightQueueStore {
 
     /// Reads the file. A missing, unreadable or malformed file is an empty
     /// queue. Events older than maxAgeSeconds are left out.
-    func load(nowMs: Int64) -> [Group] {
+    func load(nowMs: Int64) -> (groups: [Group], dropped: Int) {
         guard let data = try? Data(contentsOf: fileURL),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               (object["version"] as? NSNumber)?.intValue == RavensightQueueStore.formatVersion,
-              let groups = object["groups"] as? [[String: Any]] else { return [] }
+              let groups = object["groups"] as? [[String: Any]] else { return ([], 0) }
+        var dropped = 0
         let oldest = nowMs / 1000 - RavensightQueueStore.maxAgeSeconds
         var total = 0
         var result: [Group] = []
@@ -74,7 +75,10 @@ final class RavensightQueueStore {
             for entry in rawEvents {
                 guard let name = entry["event"] as? String, !name.isEmpty,
                       let timestamp = (entry["timestamp"] as? NSNumber)?.int64Value,
-                      timestamp >= oldest else { continue }
+                      timestamp >= oldest else {
+                    dropped += 1
+                    continue
+                }
                 let payload = entry["data"] as? [String: Any] ?? [:]
                 events.append(RavensightEvent(name: name, data: payload, timestamp: timestamp))
             }
@@ -90,9 +94,10 @@ final class RavensightQueueStore {
             let cut = min(excess, result[index].events.count)
             result[index].events.removeFirst(cut)
             excess -= cut
+            dropped += cut
             index += 1
         }
-        return result.filter { !$0.events.isEmpty }
+        return (result.filter { !$0.events.isEmpty }, dropped)
     }
 
     /// Writes the groups atomically (a temporary file renamed over the old
@@ -141,6 +146,23 @@ final class RavensightQueueStore {
             return true
         } catch {
             return false
+        }
+    }
+
+    /// Deletes every queue file in the directory (Application Support/
+    /// Ravensight by default). Used by Ravensight.resetDeviceId before
+    /// start(), when the ingest key is not known yet.
+    static func deleteAll(directory: URL? = nil) {
+        let base: URL
+        if let directory = directory {
+            base = directory
+        } else {
+            guard let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return }
+            base = support.appendingPathComponent("Ravensight", isDirectory: true)
+        }
+        let files = (try? FileManager.default.contentsOfDirectory(at: base, includingPropertiesForKeys: nil)) ?? []
+        for file in files where file.lastPathComponent.hasPrefix("queue-") && file.pathExtension == "json" {
+            try? FileManager.default.removeItem(at: file)
         }
     }
 

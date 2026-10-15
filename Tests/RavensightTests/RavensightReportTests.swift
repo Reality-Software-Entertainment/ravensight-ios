@@ -348,6 +348,40 @@ final class RavensightReportTests: XCTestCase {
         XCTAssertNil(RavensightReport.imageRefusal(data), "fits 1600 by 1600, so under the pixel limit")
         XCTAssertNil(RavensightReport(message: "x", screenshot: nil).screenshot, "no image unless one is passed")
     }
+
+    func testARetinaScreenshotKeepsItsPixelsNotItsPoints() {
+        let format = UIGraphicsImageRendererFormat.default()
+        format.scale = 3
+        let points = CGSize(width: 400, height: 300) // 1200 by 900 pixels
+        let image = UIGraphicsImageRenderer(size: points, format: format).image { context in
+            UIColor.blue.setFill()
+            context.fill(CGRect(origin: .zero, size: points))
+        }
+        guard let data = RavensightReport(message: "x", screenshot: image).screenshot,
+              let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] else {
+            return XCTFail("encoded")
+        }
+        XCTAssertEqual((properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue, 1200)
+        XCTAssertEqual((properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue, 900)
+    }
+
+    func testALargeScreenshotIsScaledToFit1600Pixels() {
+        let format = UIGraphicsImageRendererFormat.default()
+        format.scale = 3
+        let points = CGSize(width: 1000, height: 500) // 3000 by 1500 pixels
+        let image = UIGraphicsImageRenderer(size: points, format: format).image { context in
+            UIColor.green.setFill()
+            context.fill(CGRect(origin: .zero, size: points))
+        }
+        guard let data = RavensightReport(message: "x", screenshot: image).screenshot,
+              let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] else {
+            return XCTFail("encoded")
+        }
+        XCTAssertEqual((properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue, 1600)
+        XCTAssertEqual((properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue, 800)
+    }
     #endif
 
     #if canImport(ImageIO)

@@ -26,6 +26,11 @@ Every event carries `foreground_seconds_total` and
 `idle_seconds_estimate_total`: running totals for the run, across every
 launch that resumed it.
 
+Every query here was run against a local ClickHouse with the same events
+schema and a small hand made dataset (two runs, a reroll, two versions),
+and returned the expected rows. They have not been run against production
+data.
+
 ## Time per run: MAX, never SUM
 
 Each event carries the run's total so far, so the run's time is the largest
@@ -81,7 +86,7 @@ the final attempt only: choices made in an attempt the player rerolled are
 still in the data, under the earlier `attempt` number.
 
 ```sql
-WITH final AS
+WITH final_attempts AS
 (
     SELECT
         props['encounter_id'] AS encounter_id,
@@ -96,9 +101,9 @@ SELECT
     e.props['option_key'] AS option_key,
     uniqExact(e.props['encounter_id']) AS encounters
 FROM ravensight.events AS e
-INNER JOIN final
-    ON final.encounter_id = e.props['encounter_id']
-   AND final.final_attempt = toUInt32OrZero(e.props['attempt'])
+INNER JOIN final_attempts AS fa
+    ON fa.encounter_id = e.props['encounter_id']
+   AND fa.final_attempt = toUInt32OrZero(e.props['attempt'])
 WHERE e.event_name = 'choice_made'
 GROUP BY version, choice_key, option_key
 ORDER BY version, choice_key, encounters DESC

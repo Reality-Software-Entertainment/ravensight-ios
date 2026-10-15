@@ -352,6 +352,12 @@ struct RavensightCore {
         }
     }
 
+    /// Counts events dropped before they reached the queue (the persisted
+    /// file's age limit or cap).
+    mutating func countDropped(_ count: Int) {
+        counters.dropped += max(0, count)
+    }
+
     /// Moves a restored batch into the front of the live queue (its session
     /// is gone), keeping the cap.
     private mutating func demoteRestoredBatch() {
