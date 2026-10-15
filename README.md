@@ -17,12 +17,12 @@ dependencies.
 
 What has been run, and what has not:
 
-* `swift build` and `swift test` on macOS (Swift 6.4, Xcode 27.0): 125
+* `swift build` and `swift test` on macOS (Swift 6.4, Xcode 27.0): 127
   tests, the protocol core with a fake clock and the client with a fake
   transport, a fake clock, an isolated `UserDefaults` suite and a temporary
   queue directory.
 * `xcodebuild test` on the iOS Simulator (iPhone 17, iOS 27.0, Xcode 27.0):
-  128 tests, the same 125 plus three `UIImage` screenshot encoding tests
+  130 tests, the same 127 plus three `UIImage` screenshot encoding tests
   (size limit, Retina pixels kept, scaled to fit 1600 pixels), which only
   build where UIKit exists.
 * `Examples/NarrativeSample`: `swift build` and `swift test` on macOS (8
@@ -422,6 +422,8 @@ backups):
 
 * at most 500 events, the newest, whatever `maxQueueSize` says;
 * every write is atomic (a temporary file renamed over the old one);
+* because writes are coalesced, events tracked in the last quarter of a
+  second before a crash or a force quit may not be in the file yet;
 * the file is read on the SDK's work queue right after the client is
   created, and each write is coalesced over a quarter of a second (a
   background, a quit and anything that empties the queue write at once);
@@ -453,6 +455,10 @@ dashboard's report inbox.
 // A screenshot is sent only when you pass one. The SDK never captures
 // the screen; capture it yourself, after the player chose to attach it,
 // with anything private hidden.
+// The session this attempt runs under, taken before submitting. A retry is
+// only the same submission while the session is unchanged; nil (no session
+// had opened yet) means do not retry.
+let sessionAtSubmit = Ravensight.sessionToken
 let report = Ravensight.submitReport(
     category: "bug",
     message: "The ferry never arrives",
@@ -465,7 +471,7 @@ let report = Ravensight.submitReport(
     case .failure(let error)
         where ["upload_failed", "report_processing"].contains(error.code) || error.status == 0:
         // Retry later, but only under the session it was submitted in.
-        pendingReport = (report, Ravensight.sessionToken)
+        pendingReport = (report, sessionAtSubmit)
     case .failure(let error):
         print("report refused: \(error.code)")
     }

@@ -544,6 +544,60 @@ final class RavensightControlTests: XCTestCase {
         XCTAssertEqual(client.stats.queued, 0, "restored events were queued by an earlier launch")
     }
 
+    func testFacadeStopBeforeStartDeletesTheQueueAndResumeRestoresNothing() {
+        let first = makeClient(transport: FakeTransport()) { $0.persistQueue = true }
+        first.track("previous_process")
+        settle(first)
+        XCTAssertFalse(queueFiles.isEmpty)
+
+        Ravensight.resetForTesting()
+        Ravensight.stopAllTelemetry()
+        let transport = FakeTransport()
+        var configuration = RavensightConfiguration(ingestKey: "gt_live_test")
+        configuration.apiUrl = "https://fake.test"
+        configuration.trackLifecycleEvents = false
+        configuration.flushInterval = 0
+        configuration.persistQueue = true
+        let clock = self.clock
+        let client = Ravensight.start(configuration) { configuration in
+            let made = RavensightClient(
+                configuration: configuration, transport: transport, now: { clock.nowMs },
+                defaults: self.defaults, environment: [:],
+                isBackgroundLaunch: { false }, installsLifecycleObservers: false,
+                queueDirectory: self.queueDirectory
+            )
+            made.persistDelay = 0
+            return made
+        }
+        settle(client)
+        XCTAssertTrue(queueFiles.isEmpty, "a stop before start keeps nothing")
+
+        Ravensight.resumeTelemetry()
+        flushAndWait(client)
+        XCTAssertEqual(client.stats.restored, 0)
+        XCTAssertTrue(transport.sentEvents().isEmpty, "the earlier launch's events are never sent")
+        XCTAssertTrue(queueFiles.isEmpty)
+    }
+
+    func testARestoreThatDropsEverythingDeletesTheFileSoDropsAreCountedOnce() throws {
+        try FileManager.default.createDirectory(at: queueDirectory, withIntermediateDirectories: true)
+        let url = RavensightQueueStore.defaultFileURL(ingestKey: "gt_live_test", directory: queueDirectory)!
+        let nowSec = clock.nowMs / 1000
+        let file: [String: Any] = ["version": 1, "groups": [[
+            "expiresAtMs": 0,
+            "events": [
+                ["event": "ancient_1", "data": [:], "timestamp": nowSec - 100 * 86_400],
+                ["event": "ancient_2", "data": [:], "timestamp": nowSec - 120 * 86_400],
+            ],
+        ]]]
+        try JSONSerialization.data(withJSONObject: file).write(to: url)
+        let first = makeClient(transport: FakeTransport()) { $0.persistQueue = true }
+        XCTAssertEqual(first.stats.droppedEvents, 2)
+        XCTAssertTrue(queueFiles.isEmpty, "nothing kept, so the file is gone")
+        let second = makeClient(transport: FakeTransport()) { $0.persistQueue = true }
+        XCTAssertEqual(second.stats.droppedEvents, 0, "not counted again")
+    }
+
     func testASyntheticSessionNeverPersists() {
         let client = makeClient(transport: FakeTransport(), environment: playtestEnvironment) {
             $0.persistQueue = true

@@ -68,6 +68,12 @@ public struct RavensightConfiguration: Sendable {
     /// switch and a playtest stop are printed once whatever this says.
     public var verboseLogging: Bool = false
 
+    /// Set by Ravensight.start when stopAllTelemetry() was called before
+    /// it: the client starts stopped and deletes the persisted queue, as a
+    /// stop made after start would. A configuration with enabled = false
+    /// alone keeps the file for a later setEnabled(true).
+    var stoppedBeforeStart = false
+
     public init(ingestKey: String) {
         self.ingestKey = ingestKey
     }

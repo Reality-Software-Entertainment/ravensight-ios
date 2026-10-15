@@ -219,9 +219,12 @@ public final class RavensightClient: @unchecked Sendable {
         // (start() may hold the facade's lock while this runs).
         let persist = configuration.persistQueue
         let synthetic = token != nil
+        let stoppedBeforeStart = configuration.stoppedBeforeStart
         workQueue.async {
             if synthetic { return } // a synthetic run never touches the file
-            if optedOut || !persist {
+            if optedOut || !persist || stoppedBeforeStart {
+                // A stop made before start() (Ravensight.stopAllTelemetry)
+                // keeps nothing either, like a stop made after it.
                 // The player said no, or the game no longer persists: an
                 // earlier launch's events are not kept.
                 self.deleteQueueFile()
@@ -257,6 +260,12 @@ public final class RavensightClient: @unchecked Sendable {
         }
         if core.stats.restored > 0 {
             log("restored \(core.stats.restored) event(s) from the persisted queue")
+        }
+        if loaded.dropped > 0 {
+            // Rewrite now (or delete, if nothing was kept) so the next launch
+            // does not find and count the same dropped events again.
+            persistedRevision = -1
+            writeQueueNow()
         }
     }
 

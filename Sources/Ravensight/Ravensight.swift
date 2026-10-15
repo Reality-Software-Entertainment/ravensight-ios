@@ -52,7 +52,10 @@ public enum Ravensight {
         var configuration = configuration
         // A setEnabled(false) made before start (the 0.1 privacy toggle)
         // still holds for this process. It is never saved.
-        if pendingEnabled == false { configuration.enabled = false }
+        if pendingEnabled == false {
+            configuration.enabled = false
+            configuration.stoppedBeforeStart = true
+        }
         pendingEnabled = nil
         let client = makeClient(configuration)
         _shared = client

@@ -31,7 +31,8 @@ From the feedback of a native SwiftUI game on 0.2.0.
   writes, read at creation, deleted on opt-out, stop, reset and the kill
   switch, never used by a synthetic session). Restored events go out under
   the session they were queued in while it is still valid. Reads and
-  coalesced writes happen on the SDK's work queue.
+  coalesced writes happen on the SDK's work queue. With `persistQueue = false`, any
+  queue file an earlier launch left is deleted at launch.
 * `stats` (`RavensightStats`: `queued`, `delivered`, `pending`,
   `droppedEvents`, `restored`, `flushes`, `sessions`, `lastDelivery`),
   `lastDelivery` (`accepted`, `failed(status:)`, `offline`, with a
