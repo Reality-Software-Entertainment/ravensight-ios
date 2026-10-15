@@ -17,3 +17,5 @@ jobs:
         run: swift build
       - name: Test
         run: swift test
+      - name: Narrative sample
+        run: swift test --package-path Examples/NarrativeSample
