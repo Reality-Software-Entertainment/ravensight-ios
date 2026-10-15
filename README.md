@@ -459,12 +459,13 @@ dashboard's report inbox.
 // only the same submission while the session is unchanged; nil (no session
 // had opened yet) means do not retry.
 let sessionAtSubmit = Ravensight.sessionToken
-let report = Ravensight.submitReport(
+let report = RavensightReport(
     category: "bug",
     message: "The ferry never arrives",
     screenshot: capturedImage,          // UIImage? (iOS); nil for text only
     metadata: ["zone": "harbour", "attempt": 3, "hard_mode": true]
-) { result in
+)
+Ravensight.submitReport(report) { result in
     switch result {
     case .success(let receipt):
         print("report \(receipt.reportId ?? receipt.id) saved")
