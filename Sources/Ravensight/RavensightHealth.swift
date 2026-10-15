@@ -16,7 +16,9 @@ final class RavensightHealthSampler {
     /// Called from the frame hook with the last frame's duration. Takes a
     /// sample only when a second has passed since the previous one.
     func offer(frameSeconds: TimeInterval, at now: TimeInterval) {
-        guard frameSeconds > 0, frameSeconds.isFinite else { return }
+        // A frame longer than a second is a gap (the app was in the
+        // background), not a frame; it would read as an fps near zero.
+        guard frameSeconds > 0, frameSeconds <= 1, frameSeconds.isFinite else { return }
         lock.lock()
         defer { lock.unlock() }
         if let last = lastSampleAt, now - last < 1 { return }
@@ -31,6 +33,15 @@ final class RavensightHealthSampler {
             samples[next] = fps
             next = (next + 1) % RavensightHealthSampler.maxSamples
         }
+    }
+
+    /// Forgets every sample, for the start of a new session.
+    func reset() {
+        lock.lock()
+        samples = []
+        next = 0
+        lastSampleAt = nil
+        lock.unlock()
     }
 
     var sampleCount: Int {
@@ -77,22 +88,42 @@ final class RavensightHealthSampler {
     }
 }
 
+/// What the client needs from a frame source: stop it for good. The client
+/// starts one when sampling is wanted and invalidates it when tracking stops,
+/// is disabled or opted out, or the client goes away.
+protocol RavensightFrameSource: AnyObject {
+    func invalidate()
+}
+
 #if canImport(UIKit) && !os(watchOS)
 /// Feeds the sampler from a CADisplayLink on the main run loop. iOS only.
-final class RavensightFrameHook: NSObject {
+/// The link holds a weak proxy, not the hook, so dropping the hook (or
+/// calling invalidate) releases everything.
+final class RavensightFrameHook: RavensightFrameSource {
+    private final class Proxy: NSObject {
+        weak var hook: RavensightFrameHook?
+        @objc func tick(_ link: CADisplayLink) { hook?.tick(link) }
+    }
+
     private let sampler: RavensightHealthSampler
     private var link: CADisplayLink?
+    private var observer: NSObjectProtocol?
     private var lastTimestamp: CFTimeInterval = 0
 
     init(sampler: RavensightHealthSampler) {
         self.sampler = sampler
-        super.init()
-        let link = CADisplayLink(target: self, selector: #selector(tick(_:)))
+        let proxy = Proxy()
+        proxy.hook = self
+        let link = CADisplayLink(target: proxy, selector: #selector(Proxy.tick(_:)))
         link.add(to: .main, forMode: .common)
         self.link = link
+        // The link is paused in the background; do not measure the gap.
+        observer = NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.lastTimestamp = 0 }
     }
 
-    @objc private func tick(_ link: CADisplayLink) {
+    private func tick(_ link: CADisplayLink) {
         let now = link.timestamp
         if lastTimestamp > 0 {
             sampler.offer(frameSeconds: now - lastTimestamp, at: now)
@@ -100,6 +131,13 @@ final class RavensightFrameHook: NSObject {
         lastTimestamp = now
     }
 
-    deinit { link?.invalidate() }
+    func invalidate() {
+        link?.invalidate()
+        link = nil
+        if let observer = observer { NotificationCenter.default.removeObserver(observer) }
+        observer = nil
+    }
+
+    deinit { invalidate() }
 }
 #endif

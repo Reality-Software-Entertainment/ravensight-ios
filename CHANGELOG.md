@@ -14,7 +14,7 @@ All notable changes to this package are documented here.
 ### Added
 
 - Typed event helpers over `Ravensight.track`: `trackPurchase` (an `Int` or digit `String` amount), `trackResource`, `trackProgression` and `trackError`. They set the reserved `rs_*` properties, upper-case the currency, cut an error message to 200 characters and a stack to 2000, let the reserved keys win over `extra:`, and accept a `name:` override.
-- Opt-in `performance` configuration flag. On iOS a `CADisplayLink` samples the frame rate once a second (at most 600 samples), and one `health` event per session (`rs_fps_median`, `rs_fps_p10`, `rs_memory_mb`, `rs_boot_ms`) is sent on `didEnterBackground`. Nothing is sent without samples. A no-op on macOS.
+- Opt-in `performance` configuration flag. On iOS a `CADisplayLink` samples the frame rate once a second (at most 600 samples), and one `health` event per session (`rs_fps_median`, `rs_fps_p10`, `rs_memory_mb`, `rs_boot_ms`) is sent on `didEnterBackground`. Nothing is sent without samples. A no-op on macOS. Sampling stops with stopAllTelemetry, setEnabled(false) and an opt-out, and restarts when tracking resumes.
 - The session request now carries `"sdk": "ios/<version>"`.
 
 ## [0.3.1] - 2026-10-15

@@ -6,6 +6,13 @@ import XCTest
 final class RavensightTypedEventsTests: XCTestCase {
     private var suiteName = ""
     private var defaults: UserDefaults!
+    private var nowMs: Int64 = 1_800_000_000_000
+    private var sources: [FakeFrameSource] = []
+
+    final class FakeFrameSource: RavensightFrameSource {
+        var invalidated = false
+        func invalidate() { invalidated = true }
+    }
 
     override func setUp() {
         super.setUp()
@@ -125,7 +132,7 @@ final class RavensightTypedEventsTests: XCTestCase {
     // MARK: Facade through a client with the fake transport
 
     private func startClient(
-        _ transport: FakeTransport, performance: Bool = false
+        _ transport: FakeTransport, performance: Bool = false, enabled: Bool = true
     ) -> RavensightClient {
         var configuration = RavensightConfiguration(ingestKey: "gt_live_test")
         configuration.apiUrl = "https://fake.test"
@@ -133,11 +140,18 @@ final class RavensightTypedEventsTests: XCTestCase {
         configuration.trackLifecycleEvents = false
         configuration.flushInterval = 0
         configuration.performance = performance
+        configuration.enabled = enabled
         return Ravensight.start(configuration, makeClient: {
-            RavensightClient(
-                configuration: $0, transport: transport, now: { 1_800_000_000_000 },
+            let client = RavensightClient(
+                configuration: $0, transport: transport, now: { self.nowMs },
                 defaults: self.defaults, environment: [:], isBackgroundLaunch: { false },
                 installsLifecycleObservers: false)
+            client.makeFrameSource = { _ in
+                let source = FakeFrameSource()
+                self.sources.append(source)
+                return source
+            }
+            return client
         })
     }
 
@@ -264,5 +278,126 @@ final class RavensightTypedEventsTests: XCTestCase {
         off.handleDidEnterBackground()
         flush(off)
         XCTAssertTrue(healthEvents(other).isEmpty)
+    }
+
+    // MARK: Frame source lifecycle
+
+    private func waitUntil(_ condition: @escaping () -> Bool, line: UInt = #line) {
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline {
+            if condition() { return }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        XCTFail("condition not met", line: line)
+    }
+
+    func testFrameSourceFollowsStopDisableAndOptOut() {
+        let client = startClient(FakeTransport(), performance: true)
+        waitUntil { self.sources.count == 1 }
+        XCTAssertFalse(sources[0].invalidated)
+        client.stopAllTelemetry()
+        waitUntil { self.sources[0].invalidated }
+        client.resumeTelemetry()
+        waitUntil { self.sources.count == 2 }
+        client.setEnabled(false)
+        waitUntil { self.sources[1].invalidated }
+        client.setEnabled(true)
+        waitUntil { self.sources.count == 3 }
+        client.setTrackingEnabled(false)
+        waitUntil { self.sources[2].invalidated }
+        client.setTrackingEnabled(true)
+        waitUntil { self.sources.count == 4 }
+        XCTAssertFalse(sources[3].invalidated)
+    }
+
+    func testNoFrameSourceWhenDisabledOrPerformanceOff() {
+        _ = startClient(FakeTransport(), performance: true, enabled: false)
+        let off = startClient(FakeTransport(), performance: false)
+        settle(off)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        XCTAssertTrue(sources.isEmpty)
+    }
+
+    func testDroppingTheClientInvalidatesTheFrameSource() {
+        weak var weakClient: RavensightClient?
+        autoreleasepool {
+            let client = startClient(FakeTransport(), performance: true)
+            weakClient = client
+        }
+        waitUntil { self.sources.count == 1 }
+        Ravensight.resetForTesting()
+        waitUntil { weakClient == nil && self.sources[0].invalidated }
+    }
+
+    func testGapLongerThanASecondIsNotASample() {
+        let sampler = RavensightHealthSampler()
+        sampler.offer(frameSeconds: 1.0 / 60, at: 1)
+        sampler.offer(frameSeconds: 600, at: 700) // returning from the background
+        sampler.offer(frameSeconds: 1.5, at: 800)
+        XCTAssertEqual(sampler.sampleCount, 1)
+        XCTAssertEqual(sampler.summary()?.p10 ?? 0, 60, accuracy: 1e-9)
+    }
+
+    // MARK: Nothing leaves while tracking is off
+
+    private func assertQuiet(_ client: RavensightClient, _ transport: FakeTransport, line: UInt = #line) {
+        client.healthSampler.offer(frameSeconds: 1.0 / 60, at: 100)
+        settle(client)
+        let before = transport.requests.count
+        XCTAssertFalse(Ravensight.trackPurchase(amount: 1, currency: "usd", itemType: "a", itemId: "b"), line: line)
+        XCTAssertFalse(Ravensight.trackPurchase(amount: "1", currency: "usd", itemType: "a", itemId: "b"), line: line)
+        XCTAssertFalse(Ravensight.trackResource(flow: "sink", resource: "r", amount: 1), line: line)
+        XCTAssertFalse(Ravensight.trackProgression(status: "start", p1: "p"), line: line)
+        XCTAssertFalse(Ravensight.trackError(severity: "info", message: "m"), line: line)
+        client.handleDidEnterBackground()
+        flush(client)
+        XCTAssertEqual(transport.requests.count, before, line: line)
+        XCTAssertEqual(client.queuedEventCount, 0, line: line)
+        XCTAssertEqual(client.stats.pending, 0, line: line)
+    }
+
+    func testNothingQueuedOrSentWhenStopped() {
+        let transport = FakeTransport()
+        let client = startClient(transport, performance: true)
+        client.stopAllTelemetry()
+        settle(client)
+        assertQuiet(client, transport)
+    }
+
+    func testNothingQueuedOrSentWhenOptedOut() {
+        let transport = FakeTransport()
+        let client = startClient(transport, performance: true)
+        client.setTrackingEnabled(false)
+        settle(client)
+        assertQuiet(client, transport)
+    }
+
+    func testNothingSentAtAllWhenStartedDisabled() {
+        let transport = FakeTransport()
+        let client = startClient(transport, performance: true, enabled: false)
+        assertQuiet(client, transport)
+        XCTAssertTrue(transport.requests.isEmpty)
+    }
+
+    // MARK: New session re-arms health
+
+    func testHealthRearmsWithFreshSamplesAfterTheSessionTimeout() {
+        let transport = FakeTransport()
+        let client = startClient(transport, performance: true)
+        client.healthSampler.offer(frameSeconds: 1.0 / 20, at: 10)
+        client.handleDidEnterBackground()
+        settle(client)
+        nowMs += 3_600_000 // past the 30 minute sessionTimeout
+        client.handleWillEnterForeground()
+        settle(client)
+        client.healthSampler.offer(frameSeconds: 1.0 / 60, at: 20)
+        client.handleDidEnterBackground()
+        flush(client)
+        let events = healthEvents(transport)
+        XCTAssertEqual(events.count, 2)
+        let first = events[0]["data"] as? [String: Any]
+        let second = events[1]["data"] as? [String: Any]
+        XCTAssertEqual(first?["rs_fps_median"] as? Double ?? 0, 20, accuracy: 1e-9)
+        XCTAssertEqual(second?["rs_fps_median"] as? Double ?? 0, 60, accuracy: 1e-9)
     }
 }

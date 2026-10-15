@@ -336,6 +336,9 @@ path are unchanged. Each returns what `track` returns. Each takes an optional
 sent as given and the server marks the event invalid, which shows on the
 Implementation health card.
 
+An unknown `flow` or `status` is sent as given; only the default event name falls
+back to `resource_source` or `progression_start`.
+
 ```swift
 // 499 is 4.99 in the currency's minor units. The currency is upper-cased.
 Ravensight.trackPurchase(amount: 499, currency: "usd", itemType: "gems", itemId: "pack_small",
