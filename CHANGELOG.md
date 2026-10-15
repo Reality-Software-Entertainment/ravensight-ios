@@ -2,6 +2,64 @@
 
 All notable changes to this package are documented here.
 
+## [0.3.0] - 2026-10-14
+
+From the feedback of a native SwiftUI game on 0.2.0.
+
+### Breaking
+
+* `deviceId` is always the durable id. During a synthetic (playtest)
+  session it used to return `pt-<runId>`; it now returns the saved durable
+  id (empty on an install that has never run a normal session), and the
+  synthetic id is `playtestDeviceId`.
+* `resetDeviceId()` during a synthetic session used to do nothing and
+  return `pt-<runId>`. It now saves a new durable id for the next normal
+  launch and returns it; the synthetic run keeps its id and carries on.
+  `Ravensight.resetDeviceId()` before `start()` under a playtest launch
+  environment does the same instead of returning an empty string.
+
+### Added
+
+* `stopAllTelemetry()` and `resumeTelemetry()` on the client and the
+  facade: one documented control that stops normal and synthetic sessions
+  alike (timer stopped, queue cleared, track, feedback and reports refused,
+  nothing saved). It is the same switch as `enabled` and `setEnabled(_:)`.
+* `isSynthetic` and `playtestDeviceId`, and `Ravensight.deviceId`,
+  `Ravensight.playtestDeviceId`, `Ravensight.isSynthetic`.
+* `RavensightConfiguration.persistQueue` (default false): the queue in a
+  bounded file under Application Support (at most 500 events, atomic
+  writes, read at creation, deleted on opt-out, stop, reset and the kill
+  switch, never used by a synthetic session). Restored events go out under
+  the session they were queued in while it is still valid.
+* `stats` (`RavensightStats`: `queued`, `delivered`, `pending`,
+  `droppedEvents`, `restored`, `flushes`, `sessions`, `lastDelivery`),
+  `lastDelivery` (`accepted`, `failed(status:)`, `offline`, with a
+  timestamp) and `onFlush` with a `RavensightFlushOutcome` (`sent`,
+  `status`, `error`, `pending`).
+* Player Reports: `submitReport(category:message:screenshot:metadata:)`
+  (a `UIImage` on iOS, `screenshotData:` bytes anywhere) and
+  `submitReport(_ report:)` for a retry. It follows the server's report
+  routes: `POST /reports`, then for a screenshot the upload form, the
+  upload to report storage, finalize and status checks. Limits are checked
+  on the device first. One attempt per step, no automatic retry; the same
+  `RavensightReport` value resubmits the same submission. Refused with
+  `disabled` while tracking is off. A screenshot is only sent when the game
+  passes one.
+* `Examples/NarrativeSample`: run and encounter ids, a monotonic foreground
+  clock with an idle estimate, save and resume, reroll with rollback,
+  earned versus loaded progression, and `QUERIES.md`. CI runs its tests.
+* README: the three privacy controls side by side for normal and synthetic
+  sessions, a privacy sample, "Queued versus delivered", "Persisted
+  queue", "Player Reports" and a table of what this SDK supports.
+
+### Fixed
+
+* The docs no longer leave `track()`'s return value open to reading as
+  delivery: it is queue acceptance, and delivery is in `stats`,
+  `lastDelivery` and `onFlush`.
+* `setEnabled(_:)` updates `track()`'s answer before it returns, so a
+  `track` right after a stop returns false.
+
 ## [0.2.0] - 2026-10-10
 
 ### Breaking

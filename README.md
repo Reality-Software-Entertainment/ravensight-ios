@@ -2,12 +2,14 @@
 
 Official Swift SDK for [Ravensight](https://ravensight.io) player analytics.
 
-Sessions, batched events, an offline queue, rate limit handling and a server
-side kill switch, in one Swift package and no third party dependencies.
+Sessions, batched events, an offline queue (optionally persisted), rate
+limit handling, a server side kill switch, player feedback and Player
+Reports with screenshots, in one Swift package and no third party
+dependencies.
 
 * API base: `https://api.ravensight.io` (the SDK appends `/api/v1`)
 * Docs: https://ravensight.io/docs/
-* Privacy: a random per-install device id, no advertising identifier, a saved player opt-out (`Ravensight.setTrackingEnabled(false)`), a reset (`Ravensight.resetDeviceId()`), a bundled privacy manifest, no tracking permission prompt needed. What your store label can say: https://ravensight.io/docs/#privacy-label
+* Privacy: a random per-install device id, no advertising identifier, a saved player opt-out (`Ravensight.setTrackingEnabled(false)`), a stop that covers everything (`Ravensight.stopAllTelemetry()`), a reset (`Ravensight.resetDeviceId()`), a bundled privacy manifest, no tracking permission prompt needed. What your store label can say: https://ravensight.io/docs/#privacy-label
 * iOS 15 or newer, macOS 12 or newer
 * Swift Package Manager only, URLSession transport, zero dependencies
 
@@ -15,14 +17,23 @@ side kill switch, in one Swift package and no third party dependencies.
 
 What has been run, and what has not:
 
-* `swift build` and `swift test` on macOS (Swift 6.4, Xcode 27.0): 83 tests,
-  the protocol core with a fake clock and the client with a fake transport,
-  a fake clock and an isolated `UserDefaults` suite.
+* `swift build` and `swift test` on macOS (Swift 6.4, Xcode 27.0): 119
+  tests, the protocol core with a fake clock and the client with a fake
+  transport, a fake clock, an isolated `UserDefaults` suite and a temporary
+  queue directory.
 * `xcodebuild test` on the iOS Simulator (iPhone 17, iOS 27.0, Xcode 27.0):
-  the same 83 tests on iOS.
-* A Swift 6 language mode app (tools version 6.0) built against the package
-  with no diagnostics: the client and the public value types are
-  `Sendable`. The lifecycle tests call the client's handlers
+  120 tests, the same 119 plus the `UIImage` screenshot encoding test,
+  which only builds where UIKit exists.
+* `Examples/NarrativeSample`: `swift build` and `swift test` on macOS (8
+  tests), and its tests under `xcodebuild test` on the same iOS Simulator.
+  The SwiftUI executable has been built on macOS, not launched against a
+  live server.
+* Player Reports were tested against a stub transport that answers the way
+  the server's report routes do (`src/routes/v1/playerReports.js`). A
+  real upload to report storage has not been run from this SDK.
+* The 0.2.0 release was also built from a Swift 6 language mode app (tools
+  version 6.0) with no diagnostics; that check has not been repeated for
+  0.3.0. The lifecycle tests call the client's handlers
   directly; the UIKit notifications that drive them in an app, the
   background task assertion and a real swipe from the app switcher have not
   been exercised.
@@ -47,7 +58,7 @@ Or add it to your `Package.swift` yourself:
 dependencies: [
     .package(
         url: "https://github.com/Reality-Software-Entertainment/ravensight-ios.git",
-        from: "0.2.0"
+        from: "0.3.0"
     ),
 ],
 targets: [
@@ -81,10 +92,12 @@ Ravensight.track("level_completed", data: [
 ])
 ```
 
-`track` only adds the event to the queue. Nothing is sent per call: the
-queue goes out in batches of up to 50 on the flush timer, as soon as 50
-events are waiting, on `flush()`, when the app goes to the background and
-when it quits.
+`track` only adds the event to the queue, and its return value means
+exactly that: `true` is "queued", not "delivered". Nothing is sent per
+call: the queue goes out in batches of up to 50 on the flush timer, as soon
+as 50 events are waiting, on `flush()`, when the app goes to the background
+and when it quits. See "Queued versus delivered" for how to know what the
+server has.
 
 Prefer full control? Build a configuration instead:
 
@@ -102,18 +115,23 @@ Everything game code needs is static on `Ravensight`:
 | Call | What it does |
 | --- | --- |
 | `Ravensight.start(ingestKey:)` | Boots the SDK. Also takes a full `RavensightConfiguration`. |
-| `Ravensight.track(name, data:)` | Queues an event. `data` is optional. Returns false when nothing was queued (tracking off, or not started). |
+| `Ravensight.track(name, data:)` | Queues an event. `data` is optional. Returns true when the event was queued (not delivered), false when nothing was queued (tracking off, stopped, or not started). |
 | `Ravensight.flush(completion:)` | Sends queued events now. The completion fires on the main queue. |
-| `Ravensight.submitFeedback(message, category:, rating:, completion:)` | Posts player feedback. Reports a `RavensightError` on failure. |
+| `Ravensight.submitFeedback(message, category:, rating:, completion:)` | Posts player feedback text. Reports a `RavensightError` on failure. |
+| `Ravensight.submitReport(category:, message:, screenshot:, metadata:, completion:)` | Submits a Player Report, with a screenshot only if you pass one. See "Player Reports". |
 | `Ravensight.fetchSuggestions(completion)` | EXPERIMENTAL. AI generated design suggestions for your game. |
-| `Ravensight.setTrackingEnabled(_:)` | The player's choice. Saved, works before `start`. |
-| `Ravensight.resetDeviceId()` | Forgets this install's identity and returns the new id. |
+| `Ravensight.setTrackingEnabled(_:)` | The player's lasting choice. Saved, works before `start`. Does not stop a synthetic session. |
+| `Ravensight.stopAllTelemetry()` / `resumeTelemetry()` | Stops everything now, synthetic sessions included, and saves nothing. |
+| `Ravensight.resetDeviceId()` | Saves a new durable identity and returns it. Never returns a synthetic id. |
+| `Ravensight.deviceId` | The durable device id, safe to mirror. Never a synthetic id. |
+| `Ravensight.playtestDeviceId` / `isSynthetic` | The id a synthetic (playtest) run sends, and whether this run is one. |
+| `Ravensight.stats` | `queued`, `delivered`, `pending`, `droppedEvents`, `restored`, `lastDelivery`. |
 | `Ravensight.isOptedOut` | True when the player turned tracking off. |
 | `Ravensight.statusReason` | Why the SDK is not sending, or nil when it is ready. |
 | `Ravensight.sessionToken` | The current session token, nil until a session opens. |
 | `Ravensight.isReady` | True once a session exists. |
 | `Ravensight.feedbackCategories` | The six feedback categories the server accepts. |
-| `Ravensight.shared` | The underlying `RavensightClient` for anything else (`setEnabled`, `onStatusChange`, `isPlaytest`, `deviceId`). |
+| `Ravensight.shared` | The underlying `RavensightClient` for anything else (`setEnabled`, `onStatusChange`, `onFlush`, `lastDelivery`, `isPlaytest`). |
 
 `Ravensight.setEnabled(_:)` still exists but is deprecated: it is the
 runtime switch below, not saved, and it was never a safe player opt-out.
@@ -148,6 +166,7 @@ Ravensight.submitFeedback("The boss fight drags", category: "suggestion", rating
 | `gameVersion` | nil | Nil uses your app bundle's version string. |
 | `flushInterval` | `5` | Seconds between automatic batch sends. `0` sends only at 50 queued, on `flush()`, on background and on quit. |
 | `maxQueueSize` | `500` | Offline queue cap. Oldest events are dropped first. |
+| `persistQueue` | `false` | Keeps the queue in a file under Application Support so it survives a force quit. See "Persisted queue". |
 | `requestTimeout` | `15` | Per request timeout in seconds. |
 | `trackLifecycleEvents` | `true` | Sends `game_started` and `game_exited` automatically. |
 | `trackPauseEvents` | `false` | Also sends `game_paused` and `game_resumed` (iOS background and foreground, macOS focus). |
@@ -201,37 +220,69 @@ background. So on iOS a session ends by time in the background:
   scene is active. A marker left by an earlier swipe is still reported
   first when the app becomes active.
 
-## Opting out and resetting
+## Opting out, stopping and resetting
 
-`Ravensight.setTrackingEnabled(false)` is the player's choice. It is saved
-in `UserDefaults` (`ravensight_tracking_opt_out`) before the call returns,
-works before `start()`, and wins over `enabled = true` on every later
-launch. While it is off the SDK makes no request of any kind: no settings
-check, no session, no batch, no suggestions (an empty list), no feedback
-(refused locally with `disabled`). Turning it off clears the queue.
+There are three controls, and they do different things:
 
-`Ravensight.resetDeviceId()` mints a new random id, saves it, clears the
-queue, ends the current session and returns the new id. Nothing links the
-new id back to the old one.
+| Call | Saved? | Normal session | Synthetic (playtest) session |
+| --- | --- | --- | --- |
+| `setTrackingEnabled(false)` | Yes, before it returns | Queue cleared, no request of any kind, on this launch and every later one. | Ignored (one console line). The run carries on. Nothing is saved. |
+| `stopAllTelemetry()` | No | Timer stopped, queue cleared (and the persisted queue file deleted), `track` returns false, feedback and reports refused with `disabled`, no request of any kind. The next launch starts normally. | The same: the run stops sending. |
+| `resetDeviceId()` | Yes | A new durable id is saved and returned, the queue is cleared and the session ends; the next session opens under the new id. | A new durable id is saved for the next normal launch and returned. The run keeps sending as `pt-<runId>`, untouched. |
+
+`resumeTelemetry()` undoes `stopAllTelemetry()` for the rest of the run. In
+a normal session a saved opt-out still wins, so nothing is sent while the
+player has opted out. `stopAllTelemetry` and `resumeTelemetry` are the same
+switch as `RavensightConfiguration.enabled` and `setEnabled(_:)`; the new
+names say what it does.
+
+`setTrackingEnabled` is the player's choice. It is saved in `UserDefaults`
+(`ravensight_tracking_opt_out`) before the call returns, works before
+`start()`, and wins over `enabled = true` on every later launch. A
+synthetic session is driven by an agent on a test build, not by a player,
+so it ignores the player's opt-out; when a synthetic run must go quiet,
+call `stopAllTelemetry()`.
+
+### Privacy sample
 
 ```swift
-// An "Analytics" switch in your settings screen. Call it whenever the
-// player flips it, before or after Ravensight.start.
+import Ravensight
+
+// The "Analytics" switch in your settings screen.
 func setAnalytics(_ on: Bool) {
-    Ravensight.setTrackingEnabled(on) // remembered across launches
+    // Saved: holds on this launch and every later one, in a normal session.
+    Ravensight.setTrackingEnabled(on)
+    if !on {
+        // Also stop right now, synthetic (playtest) session included. Not
+        // saved; the saved opt-out above is what holds next launch.
+        Ravensight.stopAllTelemetry()
+    } else {
+        Ravensight.resumeTelemetry()
+    }
 }
 
-// A "Forget me" button: a fresh random identity from now on.
+// A "Forget me" button.
 func forgetMe() {
+    // Always a durable id, never a synthetic one: safe to store yourself.
     let newId = Ravensight.resetDeviceId()
-    print("analytics id is now \(newId)")
+    UserDefaults.standard.set(newId, forKey: "my_analytics_id_mirror")
+}
+
+// What the app sees in each kind of session.
+func describeIdentity() -> String {
+    if Ravensight.isSynthetic {
+        // deviceId is still the durable id (empty on an install that has
+        // never run a normal session); the run sends playtestDeviceId.
+        return "synthetic run \(Ravensight.playtestDeviceId ?? ""), durable id \(Ravensight.deviceId)"
+    }
+    return "player \(Ravensight.deviceId)"
 }
 ```
 
-`RavensightConfiguration.enabled` and `Ravensight.shared?.setEnabled(_:)`
-are a separate, unsaved runtime switch for the game itself (a debug build,
-a region where you do not send analytics). False means no request of any
-kind until it is turned back on.
+In a normal session `setAnalytics(false)` saves the opt-out and stops; the
+next launch makes no request at all. In a synthetic session the saved
+opt-out is ignored, but `stopAllTelemetry()` stops the run, so the switch
+still means "nothing more is sent".
 
 ## Telling players
 
@@ -243,8 +294,8 @@ store page:
 > who you are) to Ravensight so we can improve it. You can turn this off in
 > Settings at any time.
 
-The toggle behind "turn this off" is the `setAnalytics` example above, and
-"Forget me" is `resetDeviceId`.
+The toggle behind "turn this off" is the `setAnalytics` example in the
+privacy sample above, and "Forget me" is `resetDeviceId`.
 
 ## Levels and deaths
 
@@ -299,8 +350,9 @@ Rotate it from the dashboard at any time.
   oldest are dropped so the newest are always kept.
 * **Kept on failure.** An event leaves the queue when the server answers
   `202`, when the queue cap pushes it out, when tracking is turned off, or
-  when the server refuses it on its own (below). The queue lives in memory,
-  so events still queued when the process dies are lost.
+  when the server refuses it on its own (below). By default the queue lives
+  in memory, so events still queued when the process dies are lost; turn on
+  `persistQueue` to keep them (see "Persisted queue").
 * **Session expiry.** A `401` on a batch clears the session, opens a new one
   and resends the same batch, at most twice in a row before backing off.
 * **Answers that no longer apply.** A session or batch answer that arrives
@@ -323,6 +375,138 @@ both platforms. Both are best effort. The SDK deliberately does not use
 `BGTaskScheduler`; flush at points you control (the end of a level) if the
 last events matter to you.
 
+## Queued versus delivered
+
+`track` returning `true` means the event is in the queue. Delivery is a
+separate fact, reported three ways:
+
+* `Ravensight.stats` (and `client.stats`): `queued` (events accepted into
+  the queue this run), `delivered` (events the server answered `202` for),
+  `pending` (waiting now), `droppedEvents` (left the queue undelivered: the
+  cap, a `400` on a single event, or discarded by an opt-out,
+  `stopAllTelemetry`, `resetDeviceId`, the kill switch or a playtest stop),
+  `restored` (loaded from the persisted queue), `flushes`, `sessions` and
+  `lastDelivery`.
+* `client.lastDelivery`: `.accepted`, `.failed(status:)` or `.offline`,
+  with the time it happened.
+* `client.onFlush`: called on the main queue with a
+  `RavensightFlushOutcome` (`sent`, `status`, `error`, `pending`) after
+  every request that carried events, and after a failed session open that
+  held queued events back.
+
+```swift
+Ravensight.shared?.onFlush = { outcome in
+    if outcome.succeeded {
+        print("delivered \(outcome.sent), \(outcome.pending) still queued")
+    } else {
+        print("not delivered (status \(outcome.status), \(outcome.error ?? "")), will retry")
+    }
+}
+```
+
+## Persisted queue
+
+With `persistQueue = true` the queue is mirrored to one JSON file under
+Application Support (`Ravensight/queue-<key hash>.json`, excluded from
+backups):
+
+* at most 500 events, the newest, whatever `maxQueueSize` says;
+* every write is atomic (a temporary file renamed over the old one), and
+  happens whenever the queue changes;
+* the file is read when the client is created; events from it go out under
+  the session they were queued in while that session is still valid, and
+  otherwise under the next session, with their original timestamps;
+* it is deleted when the player opts out (also at launch, when a saved
+  opt-out is found), on `stopAllTelemetry`, on `resetDeviceId`, on the
+  kill switch and when the queue drains;
+* a synthetic (playtest) session never reads or writes it;
+* events older than 89 days are not restored (the server ignores events
+  older than 90 days).
+
+It narrows the window in which events can be lost; it does not close it.
+An event tracked a moment before a crash may not have been written yet.
+
+## Player Reports
+
+A Player Report is what a player writes about a problem, with optional
+detail fields, developer chosen metadata and, only if you pass one, a
+screenshot. It uses the server's report routes and shows up in the
+dashboard's report inbox.
+
+```swift
+// A screenshot is sent only when you pass one. The SDK never captures
+// the screen; capture it yourself, after the player chose to attach it,
+// with anything private hidden.
+let report = Ravensight.submitReport(
+    category: "bug",
+    message: "The ferry never arrives",
+    screenshot: capturedImage,          // UIImage? (iOS); nil for text only
+    metadata: ["zone": "harbour", "attempt": 3, "hard_mode": true]
+) { result in
+    switch result {
+    case .success(let receipt):
+        print("report \(receipt.reportId ?? receipt.id) saved")
+    case .failure(let error) where error.code == "upload_failed" || error.status == 0:
+        // Safe to retry: the same value is the same submission.
+        pendingReport = report
+    case .failure(let error):
+        print("report refused: \(error.code)")
+    }
+}
+// Later: Ravensight.submitReport(pendingReport) { ... }
+```
+
+On macOS (no UIKit) pass `screenshotData:` with JPEG, PNG or WebP bytes,
+or leave it out for a text report.
+
+What is sent: `POST /api/v1/reports` with the session token and a JSON body
+(`clientId`, `message`, `category`, `context` from your metadata,
+`capturedAt`, the optional `level`, `expected`, `steps` and `frequency`,
+and for a screenshot `image`, `bytes` and `sha256`). A text report is
+complete on that one request. A screenshot report then asks
+`POST /reports/:id/upload` for a one-time upload form, uploads the bytes to
+report storage as `multipart/form-data` (no key, session token or playtest
+header goes to storage), calls `POST /reports/:id/finalize`, and checks
+`GET /reports/:id` every 2 seconds until the server has processed the image
+(up to 35 checks).
+
+Limits, checked on the device before any request (the server checks them
+again): a message of 1 to 500 characters; a category from
+`feedbackCategories` (default `other`); metadata keys that start with a
+letter and use letters, digits and underscores (at most 40 characters),
+scalar values of at most 500 characters, at most 8 KB in all; a capture
+time within the last day; a screenshot of at most 1,000,000 bytes and
+4,000,000 pixels, a still JPEG, PNG or WebP. A `UIImage` is scaled to fit
+1600 by 1600 and encoded as JPEG once, when the report is built.
+
+Usage: a text report draws one shared usage event. A screenshot adds
+20,000, reserved when the report is accepted.
+
+Retries: the SDK makes one attempt per step and never retries a report on
+its own, because a screenshot reserves usage. The `RavensightReport` value
+fixes the `clientId`, the capture time and the screenshot bytes, so
+submitting the same value again is the same submission: the server returns
+the existing one and the SDK carries on from where it stopped. The server
+allows two upload attempts per report and releases an unfinished
+screenshot report after 15 minutes. A different message under the same
+`clientId` is refused with `submission_conflict`.
+
+Refusals: `disabled` while tracking is off (opted out, stopped, disabled or
+switched off by the server), with no request. Local: `empty_message`,
+`message_too_long`, `invalid_category`, `invalid_metadata`,
+`invalid_report`, `invalid_capture_time`, `invalid_image`,
+`image_too_large`. `no_session` when no session opened within 10 seconds.
+From the server: `report_limit`, `event_limit`, `attachments_unavailable`
+(send text instead), `feature_disabled`, `submission_conflict`,
+`upload_limit`, `upload_closed`. `upload_failed` when the upload to storage
+failed, `report_canceled`, and `report_processing` when the image was
+still being checked after the last status check (submit the same value
+again later to see the result). A `403 tracking_disabled` or
+`playtest_job_closed` stops the SDK like any other endpoint.
+
+`submitFeedback` stays as the lighter text only call (`POST /feedback`, a
+message, a category and a rating).
+
 ## Session hand-off
 
 `Ravensight.sessionToken` is the current session token, nil until a session
@@ -339,19 +523,56 @@ environment variables. On the Simulator, `xcrun simctl launch` passes a
 variable through when you prefix it with `SIMCTL_CHILD_`; an automation
 server can set it in the app's launch environment. With a token:
 
-* the device id is `pt-<runId>`, in memory only: the saved id is never read
-  or written;
+* the run sends the device id `pt-<runId>`, in memory only, exposed as
+  `playtestDeviceId`. It is never saved and the saved id is never
+  overwritten by it. `deviceId` keeps returning the durable id (empty on an
+  install that has never run a normal session), so an app that mirrors
+  `deviceId` never stores a synthetic id;
 * every request carries `X-Ravensight-Playtest: <token>`;
-* the saved player opt-out is ignored, and `setTrackingEnabled` and
-  `resetDeviceId` only log a line;
+* the saved player opt-out is ignored and `setTrackingEnabled` only logs a
+  line. `resetDeviceId` saves a new durable id for the next normal launch
+  and returns it; the run keeps its `pt-<runId>`. `stopAllTelemetry` stops
+  the run;
+* the persisted queue is not used;
 * a token without a run id never runs as a real player: nothing is sent and
   the reason is `session_failed`;
 * `403 playtest_job_closed` (reason `playtest_job_closed`) or `403
   invalid_playtest_token` (reason `session_failed`) stops the run and
   clears the queue.
 
-`RavensightClient.isPlaytest` says whether a token was found. Leave both
-unset in a build for real players.
+`RavensightClient.isPlaytest` (also `isSynthetic`) says whether a token was
+found. Leave both unset in a build for real players.
+
+## What this SDK supports
+
+| Platform surface | In this SDK |
+| --- | --- |
+| Events, sessions, batching, kill switch | Yes. |
+| Feedback text (`POST /feedback`) | Yes: `submitFeedback`. |
+| Player Reports with a screenshot | Yes, since 0.3.0: `submitReport`. A screenshot is sent only when you pass one; the SDK has no screen capture and no report form UI. |
+| Playtest tagging | Yes: token and run id from the configuration or the launch environment, the `X-Ravensight-Playtest` header, `pt-<runId>` in memory. Not from command line arguments. |
+| Player opt-out | Yes: `setTrackingEnabled`, saved. Plus `stopAllTelemetry` for a stop that also covers synthetic sessions. |
+| Persisted queue | Yes, opt-in: `persistQueue`. |
+| Journeys | Not in this SDK. There is no journey API here; when your Ravensight project has journeys enabled, the server builds them from the level events you track (see "Levels and deaths"). |
+| Design suggestions | Experimental: `fetchSuggestions`. |
+| Screen capture, a report form, crash reporting, push, purchases | Not in this SDK. |
+
+## Narrative sample
+
+`Examples/NarrativeSample` is a small Swift package for a narrative game:
+persisted run and encounter ids, a monotonic foreground clock with an
+explicit idle estimate, save and resume keeping the run id, a reroll as a
+separate attempt that rolls the story back, and earned versus loaded
+progression (one snapshot event on load, an unlock event only for a new
+earning). Its `QUERIES.md` has the matching queries: time per run as the
+MAX of a cumulative total, never a SUM, and choices grouped by game version
+and a stable key.
+
+```bash
+cd Examples/NarrativeSample
+swift test                                   # the rules, no network
+RAVENSIGHT_INGEST_KEY=gt_live_your_key swift run   # the SwiftUI front end on macOS
+```
 
 ## Concurrency contract
 
@@ -373,6 +594,9 @@ Sources/Ravensight/
     RavensightCore.swift             the whole protocol as a pure state machine
     RavensightTransport.swift        transport protocol plus request and response
   RavensightClient.swift             serial queue driver, timers, lifecycle handlers
+  RavensightReports.swift            Player Reports: the report value and its requests
+  RavensightQueueStore.swift         the opt-in persisted queue file
+  RavensightStats.swift              stats, delivery status and flush outcome types
   Ravensight.swift                   the static facade
   RavensightConfiguration.swift      configuration and error types
   RavensightLifecycle.swift          UIKit and AppKit notifications to the handlers
@@ -398,8 +622,12 @@ state machine with a fake clock and hand built responses, and
 `RavensightClientTests` drives the client over a fake transport, a fake
 clock and a throwaway `UserDefaults` suite (opt-out in every order, reset,
 key refusal, kill switch, batching, feedback, the 30 minute rule, the cold
-launch marker, background launches and playtest runs). To run the same
-suite on the iOS Simulator:
+launch marker, background launches and playtest runs),
+`RavensightControlTests` covers the stop-all control, synthetic identity,
+the persisted queue in a temporary directory and the delivery counters, and
+`RavensightReportTests` checks every Player Reports request shape and
+refusal against a stub transport. To run the same suite on the iOS
+Simulator:
 
 ```bash
 xcodebuild test -scheme Ravensight -destination 'platform=iOS Simulator,name=iPhone 17,OS=27.0'
@@ -425,14 +653,17 @@ app's privacy report. It declares:
 * `NSPrivacyTracking`: false, with no tracking domains.
 * `NSPrivacyAccessedAPITypes`: `NSPrivacyAccessedAPICategoryUserDefaults`
   with reason `CA92.1`. The SDK reads and writes its own keys (device id,
-  opt-out, background marker) and nothing else.
+  opt-out, background marker) and nothing else. The persisted queue file is
+  written and read without any API that needs a declared reason.
 * `NSPrivacyCollectedDataTypes`: Device ID and Product Interaction, each not
   linked to the player, not used for tracking, purpose Analytics.
 
 A game that sends gameplay events and nothing else can declare Device ID and
 Product Interaction as not linked to the player and not used for tracking,
 and needs no tracking permission prompt. If your events carry anything more
-(a player name, purchases), declare that yourself. The row by row answers
+(a player name, purchases), declare that yourself. The same goes for
+Player Reports: if your game sends them, declare the player's text and any
+screenshot as the data types your store form asks for. The row by row answers
 for the App Store and Google Play forms are at
 https://ravensight.io/docs/#privacy-label.
 
