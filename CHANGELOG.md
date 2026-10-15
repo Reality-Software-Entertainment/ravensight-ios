@@ -2,6 +2,13 @@
 
 All notable changes to this package are documented here.
 
+## [0.3.1] - 2026-10-15
+
+### Fixed
+
+- The coalesced queue write test waited a fixed time and could fail on a slow runner; it now waits on the write itself. No library behaviour changed.
+- The README retry sample built the report inside its own initializer and did not compile; it now builds the report first and submits it.
+
 ## [0.3.0] - 2026-10-14
 
 From the feedback of a native SwiftUI game on 0.2.0.
