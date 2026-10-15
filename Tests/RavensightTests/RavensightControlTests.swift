@@ -508,14 +508,17 @@ final class RavensightControlTests: XCTestCase {
     }
 
     func testWritesAreCoalescedAndBackgroundWritesAtOnce() {
-        persistDelay = 0.25
+        // A window far longer than the burst and its settle take on a slow
+        // runner, and a wait on the write itself rather than a fixed sleep.
+        persistDelay = 3
         let client = makeClient(transport: FakeTransport()) { $0.persistQueue = true }
+        let written = expectation(description: "coalesced write")
+        written.assertForOverFulfill = false
+        client.onQueueWrite = { written.fulfill() }
         for index in 0..<5 { client.track("e\(index)") }
         settle(client)
         XCTAssertEqual(client.queueWrites, 0, "not yet: the burst is still being coalesced")
-        let written = expectation(description: "coalesced write")
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) { written.fulfill() }
-        wait(for: [written], timeout: 2)
+        wait(for: [written], timeout: 30)
         settle(client)
         XCTAssertEqual(client.queueWrites, 1)
         XCTAssertEqual(savedEventNames().count, 5)

@@ -86,6 +86,9 @@ public final class RavensightClient: @unchecked Sendable {
     private var persistScheduled = false
     /// Queue file writes this run. Tests read it.
     private(set) var queueWrites = 0
+    /// Called on the work queue after each queue file write. Tests set it to
+    /// wait for the write itself instead of sleeping.
+    var onQueueWrite: (() -> Void)?
     /// True while the saved queue is still on disk waiting to be loaded (the
     /// client was built disabled).
     private var restoreDue = false
@@ -318,6 +321,7 @@ public final class RavensightClient: @unchecked Sendable {
         if !store.save(groups) {
             warnOnce("queue_write", "could not write the persisted queue; events stay in memory.")
         }
+        onQueueWrite?()
     }
 
     // MARK: Lifecycle
