@@ -57,7 +57,9 @@ https://github.com/Reality-Software-Entertainment/ravensight-ios.git
 ```
 
 In Xcode: File > Add Package Dependencies, paste the URL above, add the
-`Ravensight` library to your app target.
+`Ravensight` library to your app target. To keep separate development and
+production ingest keys out of source and silence telemetry under tests and
+previews, see [docs/XCODE_SETUP.md](docs/XCODE_SETUP.md).
 
 Or add it to your `Package.swift` yourself:
 
@@ -614,6 +616,34 @@ swift test                                   # the rules, no network
 RAVENSIGHT_INGEST_KEY=gt_live_your_key swift run   # the SwiftUI front end on macOS
 ```
 
+### Timing and privacy
+
+If your app reads `ProcessInfo.systemUptime`, or another API Apple lists as
+required-reason, for its own clock, the app needs its own
+`PrivacyInfo.xcprivacy` declaration for that API. The Ravensight package's
+manifest covers only the SDK's own use. For `systemUptime`, add this to the
+app's manifest:
+
+```xml
+<key>NSPrivacyAccessedAPITypes</key>
+<array>
+    <dict>
+        <key>NSPrivacyAccessedAPIType</key>
+        <string>NSPrivacyAccessedAPICategorySystemBootTime</string>
+        <key>NSPrivacyAccessedAPITypeReasons</key>
+        <array>
+            <string>35F9.1</string>
+        </array>
+    </dict>
+</array>
+```
+
+`35F9.1` is the reason for measuring time elapsed within the app. Confirm the
+reason against Apple's current list for your use. Transmit elapsed in-app
+intervals (the sample's `foreground_seconds_total`), never the raw uptime,
+which is time since boot and reveals more about the device than the analysis
+needs.
+
 ## Concurrency contract
 
 Every public call is non blocking and safe from any thread. All SDK state is
@@ -708,6 +738,11 @@ Player Reports: if your game sends them, declare the player's text and any
 screenshot as the data types your store form asks for. The row by row answers
 for the App Store and Google Play forms are at
 https://ravensight.io/docs/#privacy-label.
+
+If your own code reads a required-reason API such as `ProcessInfo.systemUptime`
+for timing, it needs its own manifest entry; see "Timing and privacy" under
+"Narrative sample". For build configuration and keeping test and preview
+runs out of your data, see [docs/XCODE_SETUP.md](docs/XCODE_SETUP.md).
 
 ## License
 

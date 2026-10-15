@@ -2,6 +2,13 @@
 
 All notable changes to this package are documented here.
 
+## [Unreleased]
+
+### Documentation
+
+- [docs/XCODE_SETUP.md](docs/XCODE_SETUP.md): separate development and production ingest keys through xcconfig files and an explicit Info.plist template, reading the key at startup, suppressing telemetry under XCTest and SwiftUI previews, and checking the built bundle (proven on Xcode 27.0).
+- A "Timing and privacy" note in the narrative sample section and its `QUERIES.md`: an app that reads `ProcessInfo.systemUptime` for its own clock needs its own privacy manifest entry, and should send elapsed in-app intervals, never raw uptime.
+
 ## [0.3.1] - 2026-10-15
 
 ### Fixed

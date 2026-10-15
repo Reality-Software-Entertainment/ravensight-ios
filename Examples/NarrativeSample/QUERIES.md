@@ -153,3 +153,31 @@ FROM ravensight.events
 WHERE event_name = 'progression_loaded'
   AND ts >= now() - INTERVAL 30 DAY
 ```
+
+### Timing and privacy
+
+If your app reads `ProcessInfo.systemUptime`, or another API Apple lists as
+required-reason, for its own clock, the app needs its own
+`PrivacyInfo.xcprivacy` declaration for that API. The Ravensight package's
+manifest covers only the SDK's own use. For `systemUptime`, add this to the
+app's manifest:
+
+```xml
+<key>NSPrivacyAccessedAPITypes</key>
+<array>
+    <dict>
+        <key>NSPrivacyAccessedAPIType</key>
+        <string>NSPrivacyAccessedAPICategorySystemBootTime</string>
+        <key>NSPrivacyAccessedAPITypeReasons</key>
+        <array>
+            <string>35F9.1</string>
+        </array>
+    </dict>
+</array>
+```
+
+`35F9.1` is the reason for measuring time elapsed within the app. Confirm the
+reason against Apple's current list for your use. Transmit elapsed in-app
+intervals (the sample's `foreground_seconds_total`), never the raw uptime,
+which is time since boot and reveals more about the device than the analysis
+needs.
