@@ -857,6 +857,7 @@ struct RavensightCore {
             "deviceId": config.deviceId,
             "gameVersion": config.gameVersion,
             "platform": config.platform,
+            "sdk": "ios/" + RavensightClient.sdkVersion,
         ]
         if let distribution = config.distribution { body["distribution"] = distribution }
         return RavensightRequest(

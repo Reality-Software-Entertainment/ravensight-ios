@@ -82,6 +82,23 @@ public final class RavensightClient: @unchecked Sendable {
     private var flushWaiters: [Waiter] = []
     /// Created and read on the main thread only.
     private var lifecycle: RavensightLifecycle?
+    /// Opt-in per-session performance sampling (configuration.performance).
+    let healthSampler = RavensightHealthSampler()
+    private var healthSent = false
+    private var bootMs: Double?
+    /// Starts a frame source feeding the sampler; nil where there is none
+    /// (macOS). Tests replace it.
+    var makeFrameSource: (RavensightHealthSampler) -> RavensightFrameSource? = {
+        #if canImport(UIKit) && !os(watchOS)
+        return RavensightFrameHook(sampler: $0)
+        #else
+        return nil
+        #endif
+    }
+    /// Main thread only.
+    private var frameSource: RavensightFrameSource?
+    /// What the work queue last asked the main thread for.
+    private var samplingWanted = false
     private var warned: Set<String> = []
     private var lastNotifiedReason: String?
 
@@ -288,6 +305,9 @@ public final class RavensightClient: @unchecked Sendable {
     }
 
     deinit {
+        if let source = frameSource {
+            DispatchQueue.main.async { source.invalidate() }
+        }
         flushTimer?.cancel()
         retryWorkItem?.cancel()
     }
@@ -382,6 +402,7 @@ public final class RavensightClient: @unchecked Sendable {
         // Inert (no key): no work queue task, no timer, no lifecycle observer.
         if isInert { return }
         let background = isBackgroundLaunch()
+        if configuration.performance { bootMs = RavensightHealthSampler.msSinceProcessStart() }
         workQueue.async {
             guard !self.started else { return }
             self.started = true
@@ -464,11 +485,40 @@ public final class RavensightClient: @unchecked Sendable {
                 self.writeBackgroundMarker()
                 self.stateChanged()
             }
+            self.queueHealthIfDue()
             self.persistQueueIfChanged(immediate: true)
             if let completion = completion {
                 self.flushWaiters.append(Waiter(callback: completion, onMain: false))
             }
             self.pump()
+        }
+    }
+
+    /// Work queue. Sampling runs only while performance is on, the client is
+    /// started and events may be queued (not disabled, opted out or stopped).
+    private func updateSampling() {
+        let want = configuration.performance && started && core.canQueue
+        guard want != samplingWanted else { return }
+        samplingWanted = want
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.frameSource?.invalidate()
+            self.frameSource = nil
+            if want { self.frameSource = self.makeFrameSource(self.healthSampler) }
+        }
+    }
+
+    /// Queues the one health event of this session, when performance
+    /// sampling is on and at least one sample exists. Work queue only.
+    /// Nothing is sent per second or from the frame hook.
+    func queueHealthIfDue() {
+        guard configuration.performance, !healthSent, let summary = healthSampler.summary() else { return }
+        let built = RavensightTypedEvents.health(
+            fpsMedian: summary.median, fpsP10: summary.p10,
+            memoryMb: RavensightHealthSampler.memoryMb(), bootMs: bootMs)
+        if core.track(name: built.name, data: built.data, nowMs: now()) {
+            healthSent = true
+            stateChanged()
         }
     }
 
@@ -499,6 +549,8 @@ public final class RavensightClient: @unchecked Sendable {
                 }
                 self.core.invalidateSession()
                 self.startedQueued = false
+                self.healthSent = false
+                self.healthSampler.reset()
                 self.queueGameStartedIfDue()
                 self.stateChanged()
                 self.pump()
@@ -1146,6 +1198,7 @@ public final class RavensightClient: @unchecked Sendable {
     /// Call after every state change on the work queue: refreshes the
     /// snapshot, the timer and the status notification.
     func stateChanged() {
+        updateSampling()
         persistQueueIfChanged()
         publishSnapshot()
         updateTimer()

@@ -126,6 +126,10 @@ Everything game code needs is static on `Ravensight`:
 | --- | --- |
 | `Ravensight.start(ingestKey:)` | Boots the SDK. Also takes a full `RavensightConfiguration`. |
 | `Ravensight.track(name, data:)` | Queues an event. `data` is optional. Returns true when the event was queued (not delivered), false when nothing was queued (tracking off, stopped, or not started). |
+| `Ravensight.trackPurchase(amount:, currency:, itemType:, itemId:, cart:, transactionId:)` | A typed purchase. `amount` is whole minor units (an `Int`, or a digit `String`). See "Typed events". |
+| `Ravensight.trackResource(flow:, resource:, amount:, itemType:, itemId:)` | A typed resource flow, `source` or `sink`. |
+| `Ravensight.trackProgression(status:, p1:, p2:, p3:, score:)` | A typed progression step: `start`, `complete` or `fail`. |
+| `Ravensight.trackError(severity:, message:, stack:)` | A typed error. The message is cut to 200 characters and the stack to 2000. |
 | `Ravensight.flush(completion:)` | Sends queued events now. The completion fires on the main queue. |
 | `Ravensight.submitFeedback(message, category:, rating:, completion:)` | Posts player feedback text. Reports a `RavensightError` on failure. |
 | `Ravensight.submitReport(category:, message:, screenshot:, metadata:, completion:)` | Submits a Player Report, with a screenshot only if you pass one. See "Player Reports". |
@@ -183,6 +187,7 @@ Ravensight.submitFeedback("The boss fight drags", category: "suggestion", rating
 | `persistQueue` | `false` | Keeps the queue in a file under Application Support so it survives a force quit. See "Persisted queue". |
 | `requestTimeout` | `15` | Per request timeout in seconds. |
 | `trackLifecycleEvents` | `true` | Sends `game_started` and `game_exited` automatically. |
+| `performance` | `false` | Opt in to one `health` event per session (frame rate, memory, boot time), sent when the app enters the background. iOS only. See "Typed events". |
 | `trackPauseEvents` | `false` | Also sends `game_paused` and `game_resumed` (iOS background and foreground, macOS focus). |
 | `sessionTimeout` | `1800` | iOS. Seconds in the background after which the session ends. |
 | `playtestToken` | nil | Ravensight Playtest token. Nil reads `RAVENSIGHT_PLAYTEST_TOKEN` from the launch environment. |
@@ -325,6 +330,50 @@ are reserved for Ravensight.
 Ravensight.track("boss_phase_begin", data: ["level": "castle", "rs_kind": "none"])
 Ravensight.track("run_over", data: ["level": "castle", "rs_kind": "death"])
 ```
+
+## Typed events
+
+The typed helpers build the reserved `rs_*` properties for you and call
+`Ravensight.track`, so queueing, batching, retries, opt-out and the playtest
+path are unchanged. Each returns what `track` returns. Each takes an optional
+`extra:` dictionary (merged first, so the reserved keys win) and an optional
+`name:` to replace the default event name. They never throw: a wrong value is
+sent as given and the server marks the event invalid, which shows on the
+Implementation health card.
+
+An unknown `flow` or `status` is sent as given; only the default event name falls
+back to `resource_source` or `progression_start`.
+
+```swift
+// 499 is 4.99 in the currency's minor units. The currency is upper-cased.
+Ravensight.trackPurchase(amount: 499, currency: "usd", itemType: "gems", itemId: "pack_small",
+                         transactionId: "t-1001")
+
+// flow is "source" (gained) or "sink" (spent). Default name resource_source or resource_sink.
+Ravensight.trackResource(flow: "sink", resource: "gold", amount: 250, itemType: "potion", itemId: "heal")
+
+// status is "start", "complete" or "fail". Default name progression_start, _complete or _fail.
+Ravensight.trackProgression(status: "complete", p1: "world1", p2: "level3", score: 1200)
+
+// severity is debug, info, warning, error or critical. Default name error.
+Ravensight.trackError(severity: "error", message: "save failed", stack: "SaveStore.write...")
+```
+
+Performance health is off until you opt in:
+
+```swift
+var configuration = RavensightConfiguration(ingestKey: "gt_live_your_key")
+configuration.performance = true
+Ravensight.start(configuration)
+```
+
+On iOS a `CADisplayLink` samples the frame rate once a second (at most 600
+samples kept). When the app enters the background the SDK sends one `health`
+event for the session with `rs_fps_median`, `rs_fps_p10`, `rs_memory_mb` (the
+process footprint) and `rs_boot_ms` (process start to `start`). iOS has no
+reliable exit callback, so background entry is the send point. With no
+samples nothing is sent, and it is never sent per second. On macOS the option
+does nothing.
 
 ## Startup outcome
 

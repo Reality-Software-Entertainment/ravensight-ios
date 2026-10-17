@@ -69,6 +69,13 @@ public struct RavensightConfiguration: Sendable {
     /// default: those were automatic before 0.2.0.
     public var trackPauseEvents: Bool = false
 
+    /// Opt-in per-session performance sampling. On iOS a frame hook samples
+    /// the frame rate once a second (at most 600 samples kept), and one
+    /// `health` event with median and 10th percentile fps, memory in MB and
+    /// boot time in ms is sent when the app enters the background. Off by
+    /// default. A no-op on macOS, which has no such hook here.
+    public var performance: Bool = false
+
     /// iOS only. Seconds in the background after which the session ends:
     /// game_exited is recorded at the moment the player left, and returning
     /// opens a new session with game_started. Default 1800 (30 minutes).
