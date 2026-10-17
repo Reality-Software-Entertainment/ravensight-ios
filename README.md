@@ -9,7 +9,7 @@ dependencies.
 
 * API base: `https://api.ravensight.io` (the SDK appends `/api/v1`)
 * Docs: https://ravensight.io/docs/
-* Privacy: a random per-install device id, no advertising identifier, a saved player opt-out (`Ravensight.setTrackingEnabled(false)`), a stop that covers everything (`Ravensight.stopAllTelemetry()`), a reset (`Ravensight.resetDeviceId()`), a bundled privacy manifest, no tracking permission prompt needed. What your store label can say: https://ravensight.io/docs/#privacy-label
+* Privacy: a random per-install device id, no advertising identifier, a saved player opt-out (`Ravensight.setTrackingEnabled(false)`), an opt-in mode that stores and sends nothing before the player's yes (`consent = .optIn`), a stop that covers everything (`Ravensight.stopAllTelemetry()`), a reset (`Ravensight.resetDeviceId()`), a bundled privacy manifest, no tracking permission prompt needed. What your store label can say: https://ravensight.io/docs/#privacy-label
 * iOS 15 or newer, macOS 12 or newer
 * Swift Package Manager only, URLSession transport, zero dependencies
 
@@ -17,12 +17,13 @@ dependencies.
 
 What has been run, and what has not:
 
-* `swift build` and `swift test` on macOS (Swift 6.4, Xcode 27.0): 127
+* `swift build` and `swift test` on macOS (Swift 6.4, Xcode 27.0): 153
   tests, the protocol core with a fake clock and the client with a fake
   transport, a fake clock, an isolated `UserDefaults` suite and a temporary
-  queue directory.
+  queue directory. 26 of them cover the 0.4.0 public build rules (see
+  "Public builds").
 * `xcodebuild test` on the iOS Simulator (iPhone 17, iOS 27.0, Xcode 27.0):
-  130 tests, the same 127 plus three `UIImage` screenshot encoding tests
+  156 tests, the same 153 plus three `UIImage` screenshot encoding tests
   (size limit, Retina pixels kept, scaled to fit 1600 pixels), which only
   build where UIKit exists.
 * `Examples/NarrativeSample`: `swift build` and `swift test` on macOS (8
@@ -67,7 +68,7 @@ Or add it to your `Package.swift` yourself:
 dependencies: [
     .package(
         url: "https://github.com/Reality-Software-Entertainment/ravensight-ios.git",
-        from: "0.3.1"
+        from: "0.4.0"
     ),
 ],
 targets: [
@@ -135,7 +136,8 @@ Everything game code needs is static on `Ravensight`:
 | `Ravensight.deviceId` | The durable device id, safe to mirror. Never a synthetic id. |
 | `Ravensight.playtestDeviceId` / `isSynthetic` | The id a synthetic (playtest) run sends, and whether this run is one. |
 | `Ravensight.stats` | `queued`, `delivered`, `pending`, `droppedEvents`, `restored`, `lastDelivery`. |
-| `Ravensight.isOptedOut` | True when the player turned tracking off. |
+| `Ravensight.isOptedOut` | True when the player turned tracking off, or, with `consent = .optIn`, has not said yes yet. |
+| `Ravensight.isEnabled` | False before `start`, while inert (no key) and after `stopAllTelemetry`. |
 | `Ravensight.statusReason` | Why the SDK is not sending, or nil when it is ready. |
 | `Ravensight.sessionToken` | The current session token, nil until a session opens. |
 | `Ravensight.isReady` | True once a session exists. |
@@ -169,7 +171,10 @@ Ravensight.submitFeedback("The boss fight drags", category: "suggestion", rating
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `ingestKey` | none | Your publishable `gt_live_...` key. |
+| `ingestKey` | none | Your publishable `gt_live_...` key, or a `gt_pub_...` public key. Empty (or only whitespace) makes the SDK inert: see "Public builds". |
+| `optional` | `false` | `true` silences the one console line an inert start prints. |
+| `consent` | `.optOut` | `.optIn` stores nothing, creates no device id and sends nothing until `setTrackingEnabled(true)`. See "Public builds". |
+| `distribution` | nil | A short label for where this build was distributed, such as `"app-store"`, sent when a session opens. At most 40 characters, no control characters; anything else is ignored with one console line. |
 | `apiUrl` | `https://api.ravensight.io` | Only change this if you self host. Whitespace and trailing slashes are trimmed and `/api/v1` is appended, so both the bare host and the `/api/v1` form work. Empty means the default. |
 | `enabled` | `true` | The game's runtime switch, never saved. `false` means no request of any kind until `shared?.setEnabled(true)`. A saved player opt-out wins over `true`. |
 | `gameVersion` | nil | Nil uses your app bundle's version string. |
@@ -330,8 +335,9 @@ changes.
 
 | Reason | Meaning |
 | --- | --- |
-| `disabled` | `enabled` is false, or the player opted out. Nothing is sent. |
-| `invalid_key` | The server refused the ingest key (`401`, or a `403` other than the ones below). Automatic sending stops for the run; events keep queueing (the cap applies) and an explicit `flush()` makes one more attempt. |
+| `no_key` | `start` was given an empty ingest key. The SDK is inert for the run: nothing is stored, no file is written, no request is made and no timer runs. |
+| `disabled` | `enabled` is false, or the player opted out (or, with `consent = .optIn`, has not opted in). Nothing is sent. |
+| `invalid_key` | The server refused the ingest key on the settings check or when opening a session (`401`, or a `403` other than the ones below). The run ends: the queue is cleared (and the persisted queue file deleted), nothing is retried, not even by `flush()`, and nothing is saved at quit. A `403` of this kind on a batch stops automatic sending and lets an explicit `flush()` try again, which then reaches the session open. |
 | `tracking_disabled` | The kill switch: `GET /settings` said tracking is off, or any endpoint answered `403 tracking_disabled`. The queue is cleared and nothing more is sent this run. |
 | `offline` | The network failed or timed out. The SDK backs off from 10 seconds, doubling to 5 minutes, and keeps the events. |
 | `rate_limited` | A `429`. The SDK waits exactly `Retry-After` and keeps the events. |
@@ -341,7 +347,7 @@ changes.
 `invalid_key`, `tracking_disabled` and the playtest stops are printed once
 to the console, whatever `verboseLogging` says. For a refused key the line
 is: `Ravensight: ingest key refused (invalid_key), sending stopped for this
-run. Check your gt_live_ key.`
+run. Check your gt_live_ or gt_pub_ key.`
 
 ## About your ingest key
 
@@ -349,6 +355,76 @@ The `gt_live_...` key is publishable. It is safe to ship inside a build: it
 can open sessions, read the tracking kill switch and read this game's design
 suggestions. It cannot read analytics, read feedback or touch your account.
 Rotate it from the dashboard at any time.
+
+## Public builds
+
+For a game whose build or source anyone can download (an open source
+project, a demo on a public page, a build shared with testers):
+
+* **Use a public key.** Create a `gt_pub_...` key in the dashboard. It can
+  open sessions and send events under the limits its policy sets (event
+  names, origins, versions, sizes), and nothing else.
+* **Inject it at build time, never commit it.** Read it from an xcconfig
+  file kept out of version control and an Info.plist entry, as in
+  [docs/XCODE_SETUP.md](docs/XCODE_SETUP.md), so a fork or a clone builds
+  without one.
+* **Without a key the SDK is inert.** `start` with an empty key stores
+  nothing in `UserDefaults`, writes no file (not even with
+  `persistQueue`), makes no request and starts no timer or lifecycle
+  observer. `track` returns false, `isEnabled` is false and `statusReason`
+  is `no_key`. It prints one console line; set `optional = true` to
+  silence it. `resetDeviceId()` forgets any saved id and returns `""`.
+* **Opt-in mode.** With `consent = .optIn` nothing happens before the
+  player's yes: no device id is created, no queue is saved, no settings
+  check is made and no session opens. Events tracked before the yes are
+  dropped, not held for later (`track` returns false). `setTrackingEnabled(true)`
+  is the yes: it is saved in `UserDefaults` under `ravensight_optin`
+  before the call returns, creates the device id and starts the SDK;
+  events tracked right after it are queued while the settings check runs.
+  `setTrackingEnabled(false)` withdraws it and keeps the device id;
+  `resetDeviceId()` is the separate "forget me", and before a yes it
+  forgets the saved id without making a new one. The default,
+  `consent = .optOut`, behaves as every earlier release did.
+* **Distribution.** `distribution = "testflight"` (or `"app-store"`, or
+  your own label, at most 40 characters) is sent when a session opens, so
+  the dashboard can tell builds apart.
+
+```swift
+var configuration = RavensightConfiguration(
+    ingestKey: Bundle.main.object(forInfoDictionaryKey: "RAVENSIGHT_INGEST_KEY") as? String ?? ""
+)
+configuration.optional = true          // a build without a key is fine
+configuration.consent = .optIn         // ask first
+configuration.distribution = "public-demo"
+Ravensight.start(configuration)
+
+// Later, from your consent screen:
+Ravensight.setTrackingEnabled(playerSaidYes)
+```
+
+`Ravensight.setTrackingEnabled` called before `start` does not know the
+consent mode yet, so it saves the choice both ways: the opt-out key, and
+`ravensight_optin` on a yes (removed on a no).
+
+What 0.4.0 adds to every build, public or not:
+
+* **`rs_event_id`.** Every event's data carries one, so the server can
+  drop a resend it already has. It is the first 16 characters of the
+  device id, the start time in hex, 8 hex characters from
+  `SecRandomCopyBytes` minted once per launch, and a counter, for example
+  `dev_3f9c0a1b2c3d-6720f1a0-9b1e44c2-12`. It always matches
+  `^[A-Za-z0-9_-]{1,64}$`, is written into the event when it is queued,
+  survives the persisted queue and a relaunch, and a resend after a
+  failure carries the same ids. A value of your own under that key is
+  replaced.
+* **An 8 KB event cap.** An event whose data is larger than 8,192 bytes as
+  JSON is dropped before it is queued, never sent: `track` returns false,
+  it counts in `stats.droppedEvents`, one console line is printed for the
+  run and `onFlush` is called with the error `event_too_large`.
+* **A refused key ends the run** (see `invalid_key` under "Startup
+  outcome").
+* **Retry jitter.** A retry wait without a `Retry-After` varies by plus or
+  minus 20 percent; a `Retry-After` is still obeyed exactly.
 
 ## How delivery works
 
@@ -370,7 +446,9 @@ Rotate it from the dashboard at any time.
   removed by an older batch's `202`.
 * **Rate limits.** A `429` honors `Retry-After` in seconds, on the settings
   check as on every other request, and so does a `503`. With no such header the SDK backs off exponentially from 10
-  seconds to a 5 minute ceiling. The queue is held.
+  seconds to a 5 minute ceiling, each wait varied by plus or minus 20
+  percent so many players who failed together do not retry together. The
+  queue is held.
 * **Oversize batches.** A `400` halves the batch and retries down to a single
   event. An event still rejected on its own is dropped, counted and logged
   once, so it cannot block everything behind it.
@@ -594,7 +672,8 @@ found. Leave both unset in a build for real players.
 | Player Reports with a screenshot | Yes, since 0.3.0: `submitReport`. A screenshot is sent only when you pass one; the SDK has no screen capture and no report form UI. |
 | Playtest tagging | Yes: token and run id from the configuration or the launch environment, the `X-Ravensight-Playtest` header, `pt-<runId>` in memory. Not from command line arguments. |
 | Player opt-out | Yes: `setTrackingEnabled`, saved. Plus `stopAllTelemetry` for a stop that also covers synthetic sessions. |
-| Persisted queue | Yes, opt-in: `persistQueue`. |
+| Persisted queue | Yes, opt-in: `persistQueue`. Each event keeps its `rs_event_id` through it. |
+| Public builds | Yes, since 0.4.0: `gt_pub_` keys, inert without a key (`optional`), `consent = .optIn`, `distribution`, `rs_event_id`, the 8 KB cap and a refused key ending the run. See "Public builds". |
 | Journeys | Not in this SDK. There is no journey API here; when your Ravensight project has journeys enabled, the server builds them from the level events you track (see "Levels and deaths"). |
 | Design suggestions | Experimental: `fetchSuggestions`. |
 | Screen capture, a report form, crash reporting, push, purchases | Not in this SDK. |
@@ -696,7 +775,10 @@ clock and a throwaway `UserDefaults` suite (opt-out in every order, reset,
 key refusal, kill switch, batching, feedback, the 30 minute rule, the cold
 launch marker, background launches and playtest runs),
 `RavensightControlTests` covers the stop-all control, synthetic identity,
-the persisted queue in a temporary directory and the delivery counters, and
+the persisted queue in a temporary directory and the delivery counters,
+`RavensightPublicBuildTests` covers the public build rules (inert without
+a key, opt-in before and after the yes, distribution, a refused key, jitter
+bounds, `rs_event_id` shape and persistence, the 8 KB cap), and
 `RavensightReportTests` checks every Player Reports request shape and
 refusal against a stub transport. To run the same suite on the iOS
 Simulator:
@@ -712,7 +794,8 @@ Pick any simulator `xcodebuild -showdestinations -scheme Ravensight` lists.
 The SDK generates a random device id on first run (`dev_` plus 32 hex
 characters, from 16 bytes of the system's secure random generator) and
 stores it in `UserDefaults` under `ravensight_device_id`. An id saved by an
-earlier version is kept as it is. No hardware identifier, advertising id,
+earlier version is kept as it is. With `consent = .optIn` it is created at
+the player's first yes, not before, and without a key it is never created. No hardware identifier, advertising id,
 IP based fingerprint or personal data is collected by the SDK itself. Only
 the events you choose to send leave the device. See "Opting out and
 resetting" for the player's controls.
@@ -725,7 +808,7 @@ app's privacy report. It declares:
 * `NSPrivacyTracking`: false, with no tracking domains.
 * `NSPrivacyAccessedAPITypes`: `NSPrivacyAccessedAPICategoryUserDefaults`
   with reason `CA92.1`. The SDK reads and writes its own keys (device id,
-  opt-out, background marker) and nothing else. The persisted queue file is
+  opt-out, opt-in, background marker) and nothing else. The persisted queue file is
   written and read without any API that needs a declared reason.
 * `NSPrivacyCollectedDataTypes`: Device ID and Product Interaction, each not
   linked to the player, not used for tracking, purpose Analytics.

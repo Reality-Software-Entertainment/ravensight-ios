@@ -4,7 +4,59 @@ All notable changes to this package are documented here.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-16
+
+For games whose builds or source anyone can download. A game that passes
+only a key behaves as on 0.3.1, except for the changes listed first.
+
+### Changed for 0.3 games
+
+- A `401` or `403` on the settings check or when opening a session (other
+  than `403 tracking_disabled` and a refused playtest token) now ends the
+  run: the queue is cleared, the persisted queue file is deleted, nothing
+  is retried (an explicit `flush()` included) and nothing is saved at
+  quit. It used to keep the queue and let `flush()` try again. A batch
+  `401` still opens a fresh session first, and `statusReason` is still
+  `invalid_key`. `isTrackingEnabled` is now false after a refused key.
+- Every event's data gains an `rs_event_id` (a value of your own under that
+  key is replaced). Events restored from a 0.3 queue file get one on load.
+- Retry waits without a `Retry-After` carry plus or minus 20 percent
+  jitter. `Retry-After` is still obeyed exactly.
+- An event whose data is over 8,192 bytes as JSON is dropped before it is
+  queued instead of being sent and refused by the server: `track` returns
+  false, it counts in `droppedEvents`, one console line is printed for the
+  run and `onFlush` reports `event_too_large`.
+- `Ravensight.setTrackingEnabled` before `start` also writes
+  `ravensight_optin` on a yes (and removes it on a no), since the consent
+  mode is not known yet.
+
+### Added
+
+- **Inert without a key.** `start` with an empty ingest key stores
+  nothing, writes no file, makes no request and installs no timer or
+  observer. `statusReason` is `no_key`, `isEnabled` is false, `track`
+  returns false, and one console line is printed unless
+  `configuration.optional` is true. `RavensightClient.isInert` and
+  `Ravensight.isEnabled` are new.
+- **`consent = .optIn`** (`RavensightConsent`): no device id, saved queue,
+  settings check or session before `setTrackingEnabled(true)`, which saves
+  the yes under `ravensight_optin`. Events tracked before the yes are
+  dropped; events right after it are queued while the settings check
+  runs. Saying no again keeps the device id; `resetDeviceId()` before a
+  yes forgets it and returns `""`. `.optOut` stays the default.
+- **`distribution`**: a label of at most 40 characters sent on
+  `POST /session`. An invalid one is ignored with one console line.
+- **`rs_event_id`**: device id prefix, start time, a launch nonce from
+  `SecRandomCopyBytes` and a counter, matching `^[A-Za-z0-9_-]{1,64}$`. It
+  survives the persisted queue and a relaunch, and a resend carries the
+  same ids.
+- A "Public builds" section in the README, and `RavensightPublicBuildTests`
+  (26 tests).
+
 ### Documentation
+
+- [docs/XCODE_SETUP.md](docs/XCODE_SETUP.md): the startup check accepts a
+  `gt_pub_` key, and notes that an empty key is now inert.
 
 - [docs/XCODE_SETUP.md](docs/XCODE_SETUP.md): separate development and production ingest keys through xcconfig files and an explicit Info.plist template, reading the key at startup, suppressing telemetry under XCTest and SwiftUI previews, and checking the built bundle (proven on Xcode 27.0).
 - A "Timing and privacy" note in the narrative sample section and its `QUERIES.md`: an app that reads `ProcessInfo.systemUptime` for its own clock needs its own privacy manifest entry, and should send elapsed in-app intervals, never raw uptime.

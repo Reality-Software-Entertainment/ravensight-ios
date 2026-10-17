@@ -92,7 +92,7 @@ enum RavensightBoot {
     static var ingestKey: String? {
         guard
             let key = Bundle.main.object(forInfoDictionaryKey: "RAVENSIGHT_INGEST_KEY") as? String,
-            key.hasPrefix("gt_live_")
+            key.hasPrefix("gt_live_") || key.hasPrefix("gt_pub_")
         else { return nil }
         return key
     }
@@ -114,9 +114,14 @@ enum RavensightBoot {
 Call `RavensightBoot.start()` where you would have called `Ravensight.start`
 (your `App` initializer). Two details from the probe: a clone without
 `Local.xcconfig` builds and puts an empty string in the plist, which is why
-the `gt_live_` prefix check is there, and the check also catches a literal
+the prefix check is there (`gt_live_`, or `gt_pub_` for a public key, since
+0.4.0), and the check also catches a literal
 `$(RAVENSIGHT_INGEST_KEY)` left in a plist that was never processed. With no
-key the SDK is simply never started, so no events are queued or sent.
+key the SDK is simply never started, so no events are queued or sent. Since
+0.4.0, `Ravensight.start` with an empty key is also safe: the SDK is inert
+(nothing stored or sent, `statusReason` is `no_key`), and
+`configuration.optional = true` silences its one console line. See "Public
+builds" in the README.
 
 Skipping `start` under XCTest and previews means a test run or a canvas
 refresh never opens a session or writes to your development game. If a test
@@ -128,7 +133,7 @@ After a build, confirm which key a given configuration really shipped. This
 prints the line with the value masked to its prefix and last four characters:
 
 ```bash
-plutil -p "$APP/Contents/Info.plist" | grep RAVENSIGHT | sed -E 's/(gt_live_).*(.{4}")/\1...\2/'
+plutil -p "$APP/Contents/Info.plist" | grep RAVENSIGHT | sed -E 's/(gt_(live|pub)_).*(.{4}")/\1...\3/'
 ```
 
 On iOS the plist is at `$APP/Info.plist`. Plain `plutil -p <app>/Info.plist
