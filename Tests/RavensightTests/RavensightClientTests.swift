@@ -177,7 +177,8 @@ final class RavensightClientTests: XCTestCase {
             defaults: defaults,
             environment: environment,
             isBackgroundLaunch: { backgroundLaunch },
-            installsLifecycleObservers: false
+            installsLifecycleObservers: false,
+            random: { 0.5 }
         )
     }
 
@@ -445,7 +446,8 @@ final class RavensightClientTests: XCTestCase {
         XCTAssertEqual(client.statusReason, "invalid_key")
         XCTAssertEqual(reasons, ["invalid_key"])
         XCTAssertFalse(client.isReady)
-        XCTAssertGreaterThan(client.queuedEventCount, 0, "the queue is kept")
+        XCTAssertEqual(client.queuedEventCount, 0, "the queue is cleared")
+        XCTAssertFalse(client.track("after"))
 
         var suggestionsCalled = false
         let fetched = expectation(description: "suggestions")
@@ -454,12 +456,10 @@ final class RavensightClientTests: XCTestCase {
         XCTAssertTrue(suggestionsCalled)
         XCTAssertEqual(transport.requests.count, 1, "no suggestions request after a refused key")
 
-        // An explicit flush makes one more attempt.
-        transport.sessionStatus = 401
+        // The run is over: not even an explicit flush tries again.
         flushAndWait(client)
-        XCTAssertEqual(transport.requests(suffix: "/session").count, 1)
         settle(client)
-        XCTAssertEqual(transport.requests.count, 2)
+        XCTAssertEqual(transport.requests.count, 1)
     }
 
     func testSessionForbiddenTrackingDisabledStopsSending() {
@@ -637,7 +637,7 @@ final class RavensightClientTests: XCTestCase {
             "expiresAt": clock.nowMs / 1000 + 3600,
             "backgroundedAt": clock.nowMs / 1000 - 60,
         ] as [String: Any], forKey: RavensightClient.markerKey)
-        RavensightClient.saveTrackingEnabled(false, defaults: defaults)
+        RavensightClient.saveTrackingEnabled(false, defaults: defaults, consent: nil)
         let optedOut = makeClient(transport: transport)
         optedOut.start()
         settle(optedOut)
@@ -701,7 +701,7 @@ final class RavensightClientTests: XCTestCase {
 
     func testPlaytestRunUsesTheRunIdentityAndHeader() {
         let transport = FakeTransport()
-        RavensightClient.saveTrackingEnabled(false, defaults: defaults) // ignored at boot
+        RavensightClient.saveTrackingEnabled(false, defaults: defaults, consent: nil) // ignored at boot
         let client = makeClient(transport: transport, environment: [
             "RAVENSIGHT_PLAYTEST_TOKEN": "pt_token",
             "RAVENSIGHT_PLAYTEST_RUN_ID": "run_7",

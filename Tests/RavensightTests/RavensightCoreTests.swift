@@ -7,7 +7,7 @@ final class RavensightCoreTests: XCTestCase {
     private var nowMs: Int64 = 1_000_000_000
 
     private func makeCore(maxQueueSize: Int = 500) -> RavensightCore {
-        return RavensightCore(config: RavensightCoreConfig(
+        var core = RavensightCore(config: RavensightCoreConfig(
             ingestKey: "gt_live_test_key",
             apiUrl: "https://api.example.com",
             gameVersion: "2.3.4",
@@ -15,6 +15,8 @@ final class RavensightCoreTests: XCTestCase {
             deviceId: "dev_test",
             maxQueueSize: maxQueueSize
         ))
+        core.random = { 0.5 } // no jitter: the backoff tests read exact waits
+        return core
     }
 
     private func jsonBody(_ object: [String: Any]) -> Data {
@@ -596,19 +598,21 @@ final class RavensightCoreTests: XCTestCase {
     // MARK: 0.2.0 contract
 
     private func makePlaytestCore() -> RavensightCore {
-        return RavensightCore(config: RavensightCoreConfig(
+        var core = RavensightCore(config: RavensightCoreConfig(
             ingestKey: "gt_live_test_key",
             apiUrl: "https://api.example.com",
             deviceId: "pt-run_1",
             playtestToken: "pt_token"
         ))
+        core.random = { 0.5 }
+        return core
     }
 
     private func forbidden(_ code: String) -> RavensightResponse {
         return RavensightResponse(status: 403, body: jsonBody(["error": code]))
     }
 
-    func testSettingsUnauthorizedRefusesKeyAndStopsAutomaticSending() {
+    func testSettingsUnauthorizedRefusesKeyAndEndsTheRun() {
         var core = makeCore()
         core.track(name: "queued", data: nil, nowMs: nowMs)
         guard case .send(_, .settings) = core.nextStep(nowMs: nowMs) else {
@@ -619,13 +623,10 @@ final class RavensightCoreTests: XCTestCase {
         XCTAssertEqual(core.statusReason, "invalid_key")
         XCTAssertEqual(core.nextStep(nowMs: nowMs), .idle, "no automatic retry after a refused key")
         XCTAssertEqual(core.nextStep(nowMs: nowMs + 3_600_000), .idle)
-        XCTAssertEqual(core.pendingEvents.count, 1, "the queue is kept")
-        XCTAssertTrue(core.track(name: "still_queues", data: nil, nowMs: nowMs))
-
-        // An explicit flush makes one more attempt.
-        guard case .send(_, .session) = core.nextStep(nowMs: nowMs, ignoringBackoff: true) else {
-            return XCTFail("expected one more attempt on an explicit flush")
-        }
+        XCTAssertTrue(core.pendingEvents.isEmpty, "the queue is cleared")
+        XCTAssertFalse(core.track(name: "refused", data: nil, nowMs: nowMs))
+        // Not even an explicit flush tries again.
+        XCTAssertEqual(core.nextStep(nowMs: nowMs, ignoringBackoff: true), .idle)
     }
 
     func testSessionUnauthorizedAndUnknownForbiddenAreInvalidKey() {

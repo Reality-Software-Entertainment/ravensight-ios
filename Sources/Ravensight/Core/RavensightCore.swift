@@ -25,6 +25,11 @@ struct RavensightCoreConfig {
     /// Bare Ravensight Playtest token, sent as X-Ravensight-Playtest on every
     /// request. Nil outside a playtest run.
     var playtestToken: String?
+    /// A validated distribution label sent on POST /session, or nil.
+    var distribution: String?
+    /// Mints every event's rs_event_id. Shared with the client, which stamps
+    /// ids on the caller's thread.
+    var eventIds: RavensightEventIds
 
     init(
         ingestKey: String,
@@ -33,7 +38,9 @@ struct RavensightCoreConfig {
         platform: String = "apple",
         deviceId: String,
         maxQueueSize: Int = RavensightCore.defaultQueueCap,
-        playtestToken: String? = nil
+        playtestToken: String? = nil,
+        distribution: String? = nil,
+        eventIds: RavensightEventIds? = nil
     ) {
         self.ingestKey = ingestKey
         self.apiUrl = RavensightCore.normalizeApiUrl(apiUrl)
@@ -42,6 +49,8 @@ struct RavensightCoreConfig {
         self.deviceId = deviceId
         self.maxQueueSize = maxQueueSize > 0 ? maxQueueSize : RavensightCore.defaultQueueCap
         self.playtestToken = (playtestToken?.isEmpty ?? true) ? nil : playtestToken
+        self.distribution = RavensightCore.validDistribution(distribution)
+        self.eventIds = eventIds ?? RavensightEventIds(deviceId: deviceId, startSec: 0)
     }
 }
 
@@ -91,9 +100,22 @@ struct RavensightCore {
     /// A batch 401 re opens the session at most this many times in a row
     /// before falling back to the exponential backoff.
     static let maxSessionReopens = 2
+    /// Retry waits without a Retry-After vary by this fraction either way,
+    /// so many clients that failed together do not retry together.
+    static let backoffJitter = 0.2
+    static let minRetryMs: Int64 = 500
+    /// An event whose data is larger than this as JSON is dropped before it
+    /// is queued, never sent.
+    static let maxEventBytes = 8192
+    /// The longest distribution label the server accepts.
+    static let maxDistributionLength = 40
+    /// The key every event's data carries for deduplication.
+    static let eventIdKey = "rs_event_id"
 
     /// The startup outcome vocabulary, shared with every Ravensight SDK.
     enum Reason {
+        /// No ingest key: the client is inert for the run.
+        static let noKey = "no_key"
         static let disabled = "disabled"
         static let invalidKey = "invalid_key"
         static let trackingDisabled = "tracking_disabled"
@@ -157,6 +179,9 @@ struct RavensightCore {
         /// Unix seconds: when the player left.
         var timestamp: Int64
         var retry: Bool
+        /// The exit's rs_event_id, assigned by setPendingExit when empty, so
+        /// a retried exit carries the same id.
+        var eventId: String = ""
     }
 
     // MARK: State
@@ -243,6 +268,9 @@ struct RavensightCore {
 
     private var counters = RavensightCoreStats()
 
+    /// 0 <= x < 1, for the backoff jitter. Tests fix it; 0.5 is no jitter.
+    var random: () -> Double = { Double.random(in: 0..<1) }
+
     init(config: RavensightCoreConfig) {
         self.config = config
     }
@@ -302,9 +330,33 @@ struct RavensightCore {
     /// Queues an event. Safe to call before the settings check or session.
     /// atSec overrides the timestamp (unix seconds), for an event that
     /// happened earlier than now. Returns false when nothing was queued.
+    ///
+    /// Every queued event's data carries an rs_event_id. eventId is one the
+    /// client already stamped into data (and measured) on the caller's
+    /// thread; nil mints one here and checks the size here. An event whose
+    /// data is over maxEventBytes as JSON is dropped (counted) and never sent.
     @discardableResult
-    mutating func track(name: String, data: [String: Any]?, nowMs: Int64, atSec: Int64? = nil) -> Bool {
+    mutating func track(
+        name: String,
+        data: [String: Any]?,
+        nowMs: Int64,
+        atSec: Int64? = nil,
+        eventId: String? = nil
+    ) -> Bool {
         guard canQueue, !name.isEmpty else { return false }
+
+        var payload: [String: Any]
+        if let eventId = eventId {
+            payload = data ?? [:]
+            payload[RavensightCore.eventIdKey] = eventId
+        } else {
+            payload = RavensightCore.sanitizeJSON(data ?? [:]) as? [String: Any] ?? [:]
+            payload[RavensightCore.eventIdKey] = config.eventIds.next()
+            if RavensightCore.eventBytes(payload) > RavensightCore.maxEventBytes {
+                counters.dropped += 1
+                return false
+            }
+        }
 
         while pendingEvents.count >= config.maxQueueSize {
             pendingEvents.removeFirst() // drop oldest so the newest always survive
@@ -312,7 +364,7 @@ struct RavensightCore {
         }
         pendingEvents.append(RavensightEvent(
             name: name,
-            data: RavensightCore.sanitizeJSON(data ?? [:]) as? [String: Any] ?? [:],
+            data: payload,
             timestamp: atSec ?? nowMs / 1000
         ))
         counters.accepted += 1
@@ -330,7 +382,14 @@ struct RavensightCore {
         nowMs: Int64
     ) {
         guard canQueue, !events.isEmpty else { return }
-        var kept = events
+        // Events saved by 0.3 have no rs_event_id; they get one now, and
+        // keep it from here on. Saved ids are never replaced.
+        var kept = events.map { event -> RavensightEvent in
+            guard event.data[RavensightCore.eventIdKey] == nil else { return event }
+            var stamped = event
+            stamped.data[RavensightCore.eventIdKey] = config.eventIds.next()
+            return stamped
+        }
         if kept.count > config.maxQueueSize {
             counters.dropped += kept.count - config.maxQueueSize
             kept = Array(kept.suffix(config.maxQueueSize))
@@ -396,6 +455,7 @@ struct RavensightCore {
     /// the next step opens a fresh session under the new id.
     mutating func replaceDeviceId(_ deviceId: String) {
         config.deviceId = deviceId
+        config.eventIds.setDeviceId(deviceId)
         discardQueue()
         invalidateSession()
     }
@@ -417,7 +477,9 @@ struct RavensightCore {
     /// that session's own token before anything else.
     mutating func setPendingExit(_ exit: PendingExit) {
         guard enabled, !optedOut, stopReason == nil, !exit.sessionToken.isEmpty else { return }
-        pendingExit = exit
+        var stamped = exit
+        if stamped.eventId.isEmpty { stamped.eventId = config.eventIds.next() }
+        pendingExit = stamped
     }
 
     private mutating func discardQueue() {
@@ -531,9 +593,9 @@ struct RavensightCore {
             trackingEnabled = true
             return []
         case 401:
-            return refuseKey()
+            return refuseKeyForRun()
         case 403:
-            return handleForbidden(response)
+            return handleForbidden(response, endsRun: true)
         case 0:
             // Unreachable: assume tracking is on so a settings outage does
             // not lose data. The session request decides the outcome.
@@ -561,9 +623,9 @@ struct RavensightCore {
 
         switch response.status {
         case 401:
-            return refuseKey()
+            return refuseKeyForRun()
         case 403:
-            return handleForbidden(response)
+            return handleForbidden(response, endsRun: true)
         case 429:
             applyRetryAfter(response, nowMs: nowMs)
             lastFailure = Reason.rateLimited
@@ -703,8 +765,9 @@ struct RavensightCore {
     }
 
     /// Routes a 403 by its error code: the kill switch, a closed or invalid
-    /// playtest token, or otherwise a refused key.
-    private mutating func handleForbidden(_ response: RavensightResponse) -> [Effect] {
+    /// playtest token, or otherwise a refused key. endsRun is set for the
+    /// settings check and the session open, where a refused key ends the run.
+    private mutating func handleForbidden(_ response: RavensightResponse, endsRun: Bool = false) -> [Effect] {
         switch response.errorCode(fallback: "") {
         case "tracking_disabled":
             return killSwitch()
@@ -715,7 +778,7 @@ struct RavensightCore {
             stop(reason: Reason.sessionFailed)
             return [.stopped(Reason.sessionFailed)]
         default:
-            return refuseKey()
+            return endsRun ? refuseKeyForRun() : refuseKey()
         }
     }
 
@@ -730,6 +793,16 @@ struct RavensightCore {
         return [.keyRefused]
     }
 
+    /// The key was refused by the settings check or the session open (401,
+    /// or a 403 that is not the kill switch or a playtest refusal): retrying
+    /// cannot help, so the run ends. The queue is cleared, nothing is retried
+    /// (an explicit flush included) and nothing is left to save at quit.
+    private mutating func refuseKeyForRun() -> [Effect] {
+        keyRefused = true
+        stop(reason: Reason.invalidKey)
+        return [.keyRefused]
+    }
+
     // MARK: Backoff
 
     private mutating func resetBackoff() {
@@ -737,8 +810,14 @@ struct RavensightCore {
         nextAttemptAtMs = 0
     }
 
+    /// The current backoff with plus or minus 20 percent jitter, never more
+    /// than the 5 minute ceiling and never less than half a second. A
+    /// Retry-After is obeyed exactly instead (applyRetryAfter).
     private mutating func scheduleBackoff(nowMs: Int64) {
-        nextAttemptAtMs = nowMs + backoffMs
+        let roll = min(max(random(), 0), 1)
+        let factor = 1 - RavensightCore.backoffJitter + 2 * RavensightCore.backoffJitter * roll
+        let jittered = min(Int64((Double(backoffMs) * factor).rounded()), RavensightCore.maxBackoffMs)
+        nextAttemptAtMs = nowMs + max(jittered, RavensightCore.minRetryMs)
         backoffMs = min(backoffMs * 2, RavensightCore.maxBackoffMs)
     }
 
@@ -774,11 +853,12 @@ struct RavensightCore {
     }
 
     private func sessionRequest() -> RavensightRequest {
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "deviceId": config.deviceId,
             "gameVersion": config.gameVersion,
             "platform": config.platform,
         ]
+        if let distribution = config.distribution { body["distribution"] = distribution }
         return RavensightRequest(
             method: "POST",
             url: config.apiUrl + "/session",
@@ -796,7 +876,8 @@ struct RavensightCore {
     }
 
     private func exitRequest(_ exit: PendingExit) -> RavensightRequest {
-        let event = RavensightEvent(name: "game_exited", data: [:], timestamp: exit.timestamp)
+        let data: [String: Any] = exit.eventId.isEmpty ? [:] : [RavensightCore.eventIdKey: exit.eventId]
+        let event = RavensightEvent(name: "game_exited", data: data, timestamp: exit.timestamp)
         return eventsRequest(events: [event.payload()], token: exit.sessionToken)
     }
 
@@ -882,6 +963,26 @@ struct RavensightCore {
         if value is NSNull { return nil }
         if let number = value as? NSNumber { return number.doubleValue }
         return nil
+    }
+
+    /// The size of an event's data as JSON, in UTF-8 bytes, the way the
+    /// server measures it (slashes are not escaped). Unencodable data counts
+    /// as too large.
+    static func eventBytes(_ data: [String: Any]) -> Int {
+        guard JSONSerialization.isValidJSONObject(data),
+              let encoded = try? JSONSerialization.data(withJSONObject: data, options: [.withoutEscapingSlashes]) else {
+            return Int.max
+        }
+        return encoded.count
+    }
+
+    /// A distribution label the server will take: trimmed, 1 to 40
+    /// characters, no control characters. Anything else is nil.
+    static func validDistribution(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else { return nil }
+        guard trimmed.utf16.count <= maxDistributionLength else { return nil }
+        let hasControl = trimmed.unicodeScalars.contains { $0.value < 0x20 || $0.value == 0x7f }
+        return hasControl ? nil : trimmed
     }
 
     static func encodeJSON(_ object: [String: Any]) -> Data {

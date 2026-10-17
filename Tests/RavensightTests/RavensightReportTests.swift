@@ -44,7 +44,8 @@ final class RavensightReportTests: XCTestCase {
             defaults: defaults,
             environment: environment,
             isBackgroundLaunch: { false },
-            installsLifecycleObservers: false
+            installsLifecycleObservers: false,
+            random: { 0.5 }
         )
         client.reportPollInterval = 0.01
         client.reportSessionWait = 2

@@ -23,7 +23,7 @@ import UIKit
 /// on the main thread. That is why it is marked @unchecked.
 public final class RavensightClient: @unchecked Sendable {
     /// This SDK's version.
-    public static let sdkVersion = "0.3.1"
+    public static let sdkVersion = "0.4.0"
     /// The default host. "/api/v1" is appended for you.
     public static let defaultApiUrl = RavensightCore.defaultApiUrl
     /// Server hard limit on POST /track/batch.
@@ -34,6 +34,8 @@ public final class RavensightClient: @unchecked Sendable {
     static let deviceIdKey = "ravensight_device_id"
     static let optOutKey = "ravensight_tracking_opt_out"
     static let markerKey = "ravensight_background_marker"
+    /// The player's yes in consent = .optIn mode.
+    static let optInKey = "ravensight_optin"
     /// The longest a quit is held for the final flush.
     static let quitHoldSeconds: TimeInterval = 1.5
 
@@ -49,6 +51,15 @@ public final class RavensightClient: @unchecked Sendable {
     /// nil in a normal session. It lives in memory only and is never saved,
     /// and deviceId never returns it.
     public let playtestDeviceId: String?
+
+    /// True when the client was created without an ingest key. It stays
+    /// inert for the run: statusReason is "no_key" and isEnabled is false.
+    public let isInert: Bool
+
+    /// The consent mode from the configuration.
+    let consent: RavensightConsent
+    /// Mints rs_event_id, shared with the core.
+    let eventIds: RavensightEventIds
 
     let workQueue = DispatchQueue(label: "io.ravensight.sdk")
     let transport: RavensightTransport
@@ -146,16 +157,25 @@ public final class RavensightClient: @unchecked Sendable {
         environment: [String: String] = ProcessInfo.processInfo.environment,
         isBackgroundLaunch: (() -> Bool)? = nil,
         installsLifecycleObservers: Bool = true,
-        queueDirectory: URL? = nil
+        queueDirectory: URL? = nil,
+        random: (() -> Double)? = nil
     ) {
         self.configuration = configuration
         self.transport = transport
-        self.now = now ?? { Int64(Date().timeIntervalSince1970 * 1000) }
+        let clock = now ?? { Int64(Date().timeIntervalSince1970 * 1000) }
+        self.now = clock
         self.defaults = defaults
         self.isBackgroundLaunch = isBackgroundLaunch ?? RavensightClient.launchedInBackground
         self.installsLifecycleObservers = installsLifecycleObservers
+        self.consent = configuration.consent
 
-        let token = RavensightClient.firstNonEmpty(
+        // No key: inert for the run. Nothing is read beyond the player's
+        // saved choice, nothing is written, no file is touched, no request
+        // is made and no timer or observer is installed.
+        let inert = configuration.ingestKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        self.isInert = inert
+
+        let token = inert ? nil : RavensightClient.firstNonEmpty(
             configuration.playtestToken, environment["RAVENSIGHT_PLAYTEST_TOKEN"]
         )
         let runId = RavensightClient.firstNonEmpty(
@@ -176,20 +196,29 @@ public final class RavensightClient: @unchecked Sendable {
             optedOut = false
             self.playtestDeviceId = deviceId
         } else {
-            deviceId = RavensightClient.loadOrCreateDeviceId(defaults)
+            optedOut = !RavensightClient.savedChoice(defaults, consent: configuration.consent)
+            if inert || (configuration.consent == .optIn && optedOut) {
+                // Inert, or opt-in with no yes yet: no id is created. One an
+                // earlier yes saved is kept (saying no keeps it).
+                deviceId = defaults.string(forKey: RavensightClient.deviceIdKey) ?? ""
+            } else {
+                deviceId = RavensightClient.loadOrCreateDeviceId(defaults)
+            }
             durableId = deviceId
-            optedOut = defaults.bool(forKey: RavensightClient.optOutKey)
             self.playtestDeviceId = nil
         }
-        self.queueFileURL = RavensightQueueStore.defaultFileURL(
+        self.queueFileURL = inert ? nil : RavensightQueueStore.defaultFileURL(
             ingestKey: configuration.ingestKey, directory: queueDirectory
         )
-        if configuration.persistQueue && token == nil {
+        if configuration.persistQueue && token == nil && !inert {
             self.queueStore = queueFileURL.map(RavensightQueueStore.init(fileURL:))
         } else {
             self.queueStore = nil
         }
 
+        let distribution = RavensightCore.validDistribution(configuration.distribution)
+        let eventIds = RavensightEventIds(deviceId: deviceId, startSec: clock() / 1000)
+        self.eventIds = eventIds
         let coreConfig = RavensightCoreConfig(
             ingestKey: configuration.ingestKey,
             apiUrl: configuration.apiUrl,
@@ -197,26 +226,44 @@ public final class RavensightClient: @unchecked Sendable {
             platform: RavensightClient.platformName(),
             deviceId: deviceId,
             maxQueueSize: configuration.maxQueueSize,
-            playtestToken: token
+            playtestToken: token,
+            distribution: distribution,
+            eventIds: eventIds
         )
         var core = RavensightCore(config: coreConfig)
+        if let random = random { core.random = random }
         // The opt-out is applied before anything can be queued or sent.
         core.setEnabled(configuration.enabled)
         core.setOptedOut(optedOut)
-        if token != nil && runId == nil {
+        if inert {
+            core.stop(reason: RavensightCore.Reason.noKey)
+        } else if token != nil && runId == nil {
             core.stop(reason: RavensightCore.Reason.sessionFailed)
         }
         self.core = core
         self.snapshot.deviceId = durableId
         self.persistedRevision = self.core.queueRevision
         self.lastNotifiedReason = self.core.statusReason
+        if inert && !configuration.optional {
+            warnOnce(
+                "no_key",
+                "no ingest key (no_key), the SDK is inert for this run: nothing is stored or sent. Set optional = true to silence this line."
+            )
+        }
         if token != nil && runId == nil {
             warnOnce(
                 "playtest_no_run",
                 "a playtest token was found without a run id (session_failed), nothing is sent this run. Set RAVENSIGHT_PLAYTEST_RUN_ID too."
             )
         }
+        if let raw = configuration.distribution, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, distribution == nil {
+            warnOnce(
+                "distribution",
+                "distribution ignored: it must be at most \(RavensightCore.maxDistributionLength) characters with no control characters."
+            )
+        }
         publishSnapshot()
+        if inert { return }
 
         // File work happens on the work queue, never on the caller's thread
         // (start() may hold the facade's lock while this runs).
@@ -332,6 +379,8 @@ public final class RavensightClient: @unchecked Sendable {
     /// background (background fetch, silent push) waits for the first
     /// foreground. Safe to call once; later calls are ignored.
     public func start() {
+        // Inert (no key): no work queue task, no timer, no lifecycle observer.
+        if isInert { return }
         let background = isBackgroundLaunch()
         workQueue.async {
             guard !self.started else { return }
@@ -570,12 +619,36 @@ public final class RavensightClient: @unchecked Sendable {
     /// event was queued, false means nothing was queued (disabled, opted
     /// out, stopped, switched off by the server, or an empty name). Whether
     /// the server has it shows in stats.delivered, lastDelivery and onFlush.
+    ///
+    /// Every queued event's data gains an rs_event_id (any value of yours
+    /// under that key is replaced), which the server uses to recognise a
+    /// resend. An event whose data is over 8,192 bytes as JSON is dropped
+    /// here and never sent: track returns false, it counts in
+    /// droppedEvents, one warning is printed for the run and onFlush is
+    /// called with the error "event_too_large".
     @discardableResult
     public func track(_ name: String, data: [String: Any]? = nil) -> Bool {
+        if isInert { return false }
         let current = readSnapshot()
         let active = current.enabled && !current.optedOut && current.trackingEnabled && !name.isEmpty
+        // Stamped and measured here, on the caller's thread, so the answer
+        // is honest about an event too large to send. The data is copied
+        // into plain JSON values first.
+        var stamped: [String: Any]?
+        var eventId: String?
+        if active {
+            var payload = RavensightCore.sanitizeJSON(data ?? [:]) as? [String: Any] ?? [:]
+            let id = eventIds.next()
+            payload[RavensightCore.eventIdKey] = id
+            if RavensightCore.eventBytes(payload) > RavensightCore.maxEventBytes {
+                workQueue.async { self.dropTooLarge(name) }
+                return false
+            }
+            stamped = payload
+            eventId = id
+        }
         workQueue.async {
-            if self.core.track(name: name, data: data, nowMs: self.now()) {
+            if self.core.track(name: name, data: stamped ?? data, nowMs: self.now(), eventId: eventId) {
                 self.stateChanged()
                 if self.core.pendingEvents.count >= RavensightCore.maxBatchSize {
                     self.pump()
@@ -585,9 +658,24 @@ public final class RavensightClient: @unchecked Sendable {
         return active
     }
 
+    /// An event over maxEventBytes: counted, warned about once, reported.
+    private func dropTooLarge(_ name: String) {
+        core.countDropped(1)
+        warnOnce(
+            "event_too_large",
+            "dropped event \"\(name)\": its data is larger than \(RavensightCore.maxEventBytes) bytes as JSON (later drops are counted, not logged)."
+        )
+        let outcome = RavensightFlushOutcome(sent: 0, status: 0, error: "event_too_large", pending: core.pendingCount)
+        if let handler = onFlush {
+            DispatchQueue.main.async { handler(outcome) }
+        }
+        stateChanged()
+    }
+
     /// Forces an immediate flush attempt of any queued events, bypassing the
-    /// backoff window once (and making one more attempt after a refused
-    /// key). The optional completion fires (on the main queue) when this
+    /// backoff window once (and making one more attempt after a key refused
+    /// on a batch; a key refused by the settings check or the session open
+    /// has ended the run). The optional completion fires (on the main queue) when this
     /// attempt has finished, whether or not the queue drained.
     public func flush(completion: (() -> Void)? = nil) {
         workQueue.async {
@@ -714,16 +802,32 @@ public final class RavensightClient: @unchecked Sendable {
     /// every later launch, and a saved opt-out wins over
     /// configuration.enabled. Turning off clears the queue and stops the
     /// timer. A no-op under a playtest run.
+    ///
+    /// With consent = .optIn, true is the player's yes: it is saved under
+    /// ravensight_optin, the device id is created (if there is none yet) and
+    /// the SDK starts; events tracked right after it are queued while the
+    /// settings check runs. false withdraws it and keeps the device id
+    /// (resetDeviceId forgets it). While inert the choice is saved and
+    /// nothing else happens.
     public func setTrackingEnabled(_ enabled: Bool) {
         if isPlaytest {
             print("Ravensight: setTrackingEnabled is ignored during a playtest run")
             return
         }
-        RavensightClient.saveTrackingEnabled(enabled, defaults: defaults)
+        RavensightClient.saveTrackingEnabled(enabled, defaults: defaults, consent: consent)
+        // The first yes in opt-in mode is the first moment an id may exist.
+        var minted: String?
         snapshotLock.lock()
         snapshot.optedOut = !enabled
+        if enabled && !isInert && snapshot.deviceId.isEmpty {
+            let id = RavensightClient.loadOrCreateDeviceId(defaults)
+            snapshot.deviceId = id
+            minted = id
+        }
         snapshotLock.unlock()
+        if let id = minted { eventIds.setDeviceId(id) }
         workQueue.async {
+            if let id = minted { self.core.replaceDeviceId(id) }
             self.core.setOptedOut(!enabled)
             if !enabled { self.deleteQueueFile() }
             if enabled { self.queueGameStartedIfDue() }
@@ -784,8 +888,27 @@ public final class RavensightClient: @unchecked Sendable {
     /// next one opens under the new id). In a synthetic (playtest) session
     /// the run carries on as pt-<runId>, untouched; the new durable id is
     /// saved for the next normal launch and returned.
+    ///
+    /// While inert, or with consent = .optIn before the player's yes, the
+    /// saved id (if any) is forgotten and none is made: it returns "".
     @discardableResult
     public func resetDeviceId() -> String {
+        if !isPlaytest && (isInert || (consent == .optIn && readSnapshot().optedOut)) {
+            defaults.removeObject(forKey: RavensightClient.deviceIdKey)
+            defaults.removeObject(forKey: RavensightClient.markerKey)
+            snapshotLock.lock()
+            snapshot.deviceId = ""
+            snapshotLock.unlock()
+            eventIds.setDeviceId("")
+            if !isInert {
+                workQueue.async {
+                    self.core.replaceDeviceId("")
+                    self.deleteQueueFile()
+                    self.stateChanged()
+                }
+            }
+            return ""
+        }
         let fresh = RavensightClient.mintDeviceId()
         defaults.set(fresh, forKey: RavensightClient.deviceIdKey)
         defaults.removeObject(forKey: RavensightClient.markerKey)
@@ -814,8 +937,9 @@ public final class RavensightClient: @unchecked Sendable {
     /// is ever collected.
     public var deviceId: String { return readSnapshot().deviceId }
 
-    /// The game's runtime switch (configuration.enabled, setEnabled).
-    public var isEnabled: Bool { return readSnapshot().enabled }
+    /// The game's runtime switch (configuration.enabled, setEnabled). Always
+    /// false while inert (no ingest key).
+    public var isEnabled: Bool { return !isInert && readSnapshot().enabled }
 
     /// True when the player opted out with setTrackingEnabled(false).
     public var isOptedOut: Bool { return readSnapshot().optedOut }
@@ -834,8 +958,8 @@ public final class RavensightClient: @unchecked Sendable {
     /// can pass it as joinToken so its events join this player's session.
     public var sessionToken: String? { return readSnapshot().sessionToken }
 
-    /// Why the client is not sending, or nil when it is ready: "disabled",
-    /// "invalid_key", "tracking_disabled", "offline", "rate_limited",
+    /// Why the client is not sending, or nil when it is ready: "no_key"
+    /// (inert, no ingest key), "disabled", "invalid_key", "tracking_disabled", "offline", "rate_limited",
     /// "session_failed" or "playtest_job_closed".
     public var statusReason: String? { return readSnapshot().reason }
 
@@ -995,7 +1119,7 @@ public final class RavensightClient: @unchecked Sendable {
             case .trackingDisabled:
                 warnOnce("tracking_disabled", "tracking disabled by the server kill switch (tracking_disabled), sending stopped for this run.")
             case .keyRefused:
-                warnOnce("invalid_key", "ingest key refused (invalid_key), sending stopped for this run. Check your gt_live_ key.")
+                warnOnce("invalid_key", "ingest key refused (invalid_key), sending stopped for this run. Check your gt_live_ or gt_pub_ key.")
             case .stopped(let reason):
                 if reason == RavensightCore.Reason.playtestJobClosed {
                     warnOnce(reason, "playtest job closed (playtest_job_closed), sending stopped for this run.")
@@ -1098,14 +1222,35 @@ public final class RavensightClient: @unchecked Sendable {
 
     // MARK: Storage
 
-    /// Saves the player's choice without needing a client.
-    static func saveTrackingEnabled(_ enabled: Bool, defaults: UserDefaults) {
+    /// Saves the player's choice without needing a client. The opt-out key
+    /// is always written, as before 0.4.0. In opt-in mode the yes is also
+    /// written (or removed) under ravensight_optin; consent nil (before
+    /// start(), when the mode is not known yet) writes it on a yes and
+    /// removes it on a no, so either mode reads the same choice.
+    static func saveTrackingEnabled(_ enabled: Bool, defaults: UserDefaults, consent: RavensightConsent?) {
         defaults.set(!enabled, forKey: optOutKey)
+        if consent == .optIn || consent == nil {
+            if enabled {
+                defaults.set(true, forKey: optInKey)
+            } else {
+                defaults.removeObject(forKey: optInKey)
+            }
+        }
+    }
+
+    /// The player's saved choice in a consent mode: true when tracking may
+    /// run. opt-out: on unless an opt-out was saved. opt-in: off until a yes
+    /// was saved.
+    static func savedChoice(_ defaults: UserDefaults, consent: RavensightConsent) -> Bool {
+        switch consent {
+        case .optOut: return !defaults.bool(forKey: optOutKey)
+        case .optIn: return defaults.bool(forKey: optInKey)
+        }
     }
 
     /// An existing saved id is kept exactly as it is; only a missing one is
     /// minted.
-    private static func loadOrCreateDeviceId(_ defaults: UserDefaults) -> String {
+    static func loadOrCreateDeviceId(_ defaults: UserDefaults) -> String {
         if let existing = defaults.string(forKey: deviceIdKey), !existing.isEmpty {
             return existing
         }

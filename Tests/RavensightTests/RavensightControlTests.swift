@@ -51,7 +51,8 @@ final class RavensightControlTests: XCTestCase {
             environment: environment,
             isBackgroundLaunch: { false },
             installsLifecycleObservers: false,
-            queueDirectory: queueDirectory
+            queueDirectory: queueDirectory,
+            random: { 0.5 }
         )
         client.persistDelay = persistDelay
         // The file is read on the work queue; wait for it like a caller of
@@ -180,7 +181,7 @@ final class RavensightControlTests: XCTestCase {
 
     func testResumeDoesNotOverrideASavedOptOut() {
         let transport = FakeTransport()
-        RavensightClient.saveTrackingEnabled(false, defaults: defaults)
+        RavensightClient.saveTrackingEnabled(false, defaults: defaults, consent: nil)
         let client = makeClient(transport: transport)
         client.start()
         client.stopAllTelemetry()
@@ -361,7 +362,15 @@ final class RavensightControlTests: XCTestCase {
             $0.persistQueue = true
             $0.maxQueueSize = 800
         }
+        // Coalesced, as in an app: 600 uncoalesced writes of up to 500
+        // events each are slow, and the test is about the cap.
+        client.persistDelay = 0.1
+        let written = expectation(description: "coalesced write")
+        written.assertForOverFulfill = false
+        client.onQueueWrite = { written.fulfill() }
         for index in 0..<600 { client.track("e\(index)") }
+        settle(client)
+        wait(for: [written], timeout: 30)
         settle(client)
         let names = savedEventNames()
         XCTAssertEqual(names.count, 500)
@@ -384,7 +393,7 @@ final class RavensightControlTests: XCTestCase {
         let first = makeClient(transport: FakeTransport()) { $0.persistQueue = true }
         first.track("a")
         settle(first)
-        RavensightClient.saveTrackingEnabled(false, defaults: defaults)
+        RavensightClient.saveTrackingEnabled(false, defaults: defaults, consent: nil)
         let second = makeClient(transport: FakeTransport()) { $0.persistQueue = true }
         XCTAssertEqual(second.queuedEventCount, 0)
         XCTAssertTrue(queueFiles.isEmpty)

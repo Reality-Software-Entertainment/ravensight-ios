@@ -2,11 +2,30 @@ import Foundation
 
 /// Everything the SDK needs to run. Only the ingest key is required.
 public struct RavensightConfiguration: Sendable {
-    /// Your PUBLISHABLE ingest key (gt_live_...). Safe to ship in a client
-    /// build: it can open sessions, read the tracking kill switch and read
-    /// this game's design suggestions. It cannot read analytics, read
-    /// feedback or touch your account.
+    /// Your PUBLISHABLE ingest key (gt_live_..., or a gt_pub_... public key
+    /// for a build anyone can download). Safe to ship in a client build: it
+    /// can open sessions, read the tracking kill switch and read this game's
+    /// design suggestions. It cannot read analytics, read feedback or touch
+    /// your account. Empty (or only whitespace) makes the SDK inert.
     public var ingestKey: String
+
+    /// True silences the one warning an empty ingestKey prints. Without a key
+    /// the SDK is inert either way: nothing stored, no file, no request, no
+    /// timer, statusReason "no_key". For a public build whose key is injected
+    /// at build time and may be absent.
+    public var optional: Bool = false
+
+    /// Whether the player must say yes first. .optOut (the default) collects
+    /// until the player opts out. .optIn creates no device id, saves no
+    /// queue and makes no request until setTrackingEnabled(true); events
+    /// tracked before that yes are dropped, not held.
+    public var consent: RavensightConsent = .optOut
+
+    /// A short label for where this build was distributed (for example
+    /// "app-store" or "testflight"), sent on POST /session. At most 40
+    /// characters with no control characters, surrounding whitespace
+    /// trimmed; anything else is ignored with one warning.
+    public var distribution: String?
 
     /// Base URL. Leave the default unless you self host. Whitespace and
     /// trailing slashes are trimmed and "/api/v1" is appended, so the bare
@@ -77,6 +96,16 @@ public struct RavensightConfiguration: Sendable {
     public init(ingestKey: String) {
         self.ingestKey = ingestKey
     }
+}
+
+/// When collection may start. See RavensightConfiguration.consent.
+public enum RavensightConsent: String, Sendable {
+    /// Collect until the player opts out with setTrackingEnabled(false). The
+    /// default, and the behaviour of every release before 0.4.0.
+    case optOut = "opt_out"
+    /// Collect nothing until the player opts in with setTrackingEnabled(true).
+    /// The yes is saved in UserDefaults under ravensight_optin.
+    case optIn = "opt_in"
 }
 
 /// Reported by the explicit request helpers (feedback, suggestions).

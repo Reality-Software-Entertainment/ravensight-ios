@@ -72,6 +72,14 @@ public enum Ravensight {
         lock.unlock()
     }
 
+    /// True while the shared client exists and has an ingest key, and the
+    /// game has not switched it off (stopAllTelemetry, setEnabled). False
+    /// before start() and while inert. Whether anything is being sent right
+    /// now is statusReason (nil) and isReady.
+    public static var isEnabled: Bool {
+        return shared?.isEnabled ?? false
+    }
+
     /// Boots the SDK with just an ingest key. Only pass apiUrl if you self
     /// host; gameVersion defaults to the app bundle's version.
     @discardableResult
@@ -217,12 +225,13 @@ public enum Ravensight {
         } else if launchedForPlaytest {
             print("Ravensight: setTrackingEnabled is ignored during a playtest run")
         } else {
-            RavensightClient.saveTrackingEnabled(enabled, defaults: .standard)
+            RavensightClient.saveTrackingEnabled(enabled, defaults: .standard, consent: nil)
         }
     }
 
-    /// True when the player opted out with setTrackingEnabled(false). Reads
-    /// the saved choice when the SDK has not been started.
+    /// True when the player opted out with setTrackingEnabled(false), or,
+    /// with consent = .optIn, has not said yes yet. Reads the saved opt-out
+    /// when the SDK has not been started.
     public static var isOptedOut: Bool {
         if let client = shared { return client.isOptedOut }
         return UserDefaults.standard.bool(forKey: RavensightClient.optOutKey)
