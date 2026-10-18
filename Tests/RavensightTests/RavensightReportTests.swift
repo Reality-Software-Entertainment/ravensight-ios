@@ -324,6 +324,20 @@ final class RavensightReportTests: XCTestCase {
         XCTAssertTrue(reportRequests(transport).isEmpty)
     }
 
+    func testIdentityResetDuringStorageUploadStopsFinalization() {
+        let transport = FakeTransport()
+        serveReports(transport)
+        let client = makeClient(transport: transport)
+        let original = transport.override
+        transport.override = { request in
+            if request.url.hasPrefix("https://storage.test") { client.resetDeviceId() }
+            return original?(request)
+        }
+        client.start()
+        XCTAssertEqual(code(submit(client, RavensightReport(message: "Private", screenshotData: tinyPNG))), "report_session_changed")
+        XCTAssertFalse(transport.requests.contains { $0.url.hasSuffix("/finalize") })
+    }
+
     func testAPendingSubmissionWithoutTheScreenshotIsAConflict() {
         let transport = FakeTransport()
         transport.override = { [unowned self] request in

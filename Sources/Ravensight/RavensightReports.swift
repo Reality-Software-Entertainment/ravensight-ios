@@ -388,9 +388,13 @@ extension RavensightClient {
 
     // MARK: Steps (work queue)
 
-    private func refusedWhileStopped(_ finish: ReportCompletion) -> Bool {
+    private func refusedWhileStopped(_ finish: ReportCompletion, token: String? = nil) -> Bool {
         guard core.isActive else {
             finish(.failure(RavensightError(code: "disabled", status: 0, message: "tracking turned off, report stopped")))
+            return true
+        }
+        if let token = token, core.sessionToken != token {
+            finish(.failure(RavensightError(code: "report_session_changed", status: 0, message: "session changed, report stopped")))
             return true
         }
         return false
@@ -451,7 +455,7 @@ extension RavensightClient {
         _ report: RavensightReport, id: String, state: [String: Any], token: String,
         uploaded: Bool, polls: Int, finish: @escaping ReportCompletion
     ) {
-        if refusedWhileStopped(finish) { return }
+        if refusedWhileStopped(finish, token: token) { return }
         let status = state["status"] as? String ?? ""
         switch status {
         case "complete":
@@ -482,7 +486,7 @@ extension RavensightClient {
                 return
             }
             workQueue.asyncAfter(deadline: .now() + reportPollInterval) {
-                if self.refusedWhileStopped(finish) { return }
+                if self.refusedWhileStopped(finish, token: token) { return }
                 let request = self.core.reportRequest(method: "GET", path: "/" + id, body: nil, token: token)
                 self.sendReport(request) { response in
                     guard response.status == 200, let object = response.json as? [String: Any] else {
@@ -510,7 +514,7 @@ extension RavensightClient {
                 finish(.failure(RavensightError(code: "upload_failed", status: 0, message: "the upload address is not https")))
                 return
             }
-            if self.refusedWhileStopped(finish) { return }
+            if self.refusedWhileStopped(finish, token: token) { return }
             let fields = form["fields"] as? [String: Any] ?? [:]
             let upload = RavensightClient.multipartUpload(url: url, fields: fields, file: image)
             // The upload goes to storage, not to Ravensight: no key, no
@@ -529,7 +533,7 @@ extension RavensightClient {
     }
 
     private func finalizeReport(_ report: RavensightReport, id: String, token: String, finish: @escaping ReportCompletion) {
-        if refusedWhileStopped(finish) { return }
+        if refusedWhileStopped(finish, token: token) { return }
         let request = core.reportRequest(method: "POST", path: "/" + id + "/finalize", body: [:], token: token)
         sendReport(request) { response in
             guard (response.status == 202 || response.status == 200), let object = response.json as? [String: Any] else {

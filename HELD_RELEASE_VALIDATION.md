@@ -21,3 +21,5 @@ Config identifier compatibility audit: 4 focused Swift config tests passed.
 Config property keys reject constructor/prototype, including nested JSON properties.
 Experiment keys and variant labels may use those words as string values, matching
 the server contract. Regression coverage distinguishes those cases. Publishing remains held.
+
+Player Reports identity audit: full `swift test` passes 181 tests, including 12 report tests. A new regression resets identity during screenshot storage upload and verifies no finalization using the old session. Report async boundaries now stop when the session changes. macOS Swift validation does not exercise UIKit capture on an iOS device or live object storage. Publishing remains held.
