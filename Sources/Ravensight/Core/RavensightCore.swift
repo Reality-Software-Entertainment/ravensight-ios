@@ -208,6 +208,8 @@ struct RavensightCore {
     /// cleared by the next success.
     private(set) var lastFailure: String?
 
+    var configExperiments: [String: String] = [:]
+    var configExperimentDevice: String = ""
     private(set) var sessionToken: String?
     /// Unix milliseconds.
     private(set) var sessionExpiresAtMs: Int64 = 0
@@ -358,6 +360,13 @@ struct RavensightCore {
             }
         }
 
+        if configExperimentDevice == config.deviceId {
+            for (key, variant) in configExperiments { payload["rs_exp_" + key] = variant }
+        }
+        if RavensightCore.eventBytes(payload) > RavensightCore.maxEventBytes {
+            counters.dropped += 1
+            return false
+        }
         while pendingEvents.count >= config.maxQueueSize {
             pendingEvents.removeFirst() // drop oldest so the newest always survive
             counters.dropped += 1

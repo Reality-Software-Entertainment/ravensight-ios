@@ -102,6 +102,17 @@ public enum Ravensight {
         return client.track(name, data: data)
     }
 
+    public static func fetchConfig(completion: ((RavensightConfigResult) -> Void)? = nil) {
+        guard let client = shared else {
+            if let completion = completion { DispatchQueue.main.async { completion(RavensightConfigResult(source: "default", values: [:])) } }
+            return
+        }
+        client.fetchConfig(completion: completion)
+    }
+    public static func getConfig<T>(_ key: String, default fallback: T) -> T {
+        shared?.getConfig(key, default: fallback) ?? fallback
+    }
+
     /// Sends queued events now, bypassing the backoff window once.
     public static func flush(completion: (() -> Void)? = nil) {
         guard let client = shared else {

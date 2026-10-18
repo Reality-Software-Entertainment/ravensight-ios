@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.1 (held)
+
+- Add session-start config fetching, scoped persistent cache, ETags and thread-safe typed getters.
+- Deliver readiness callbacks on the main queue; discard late responses after identity or consent changes.
+- Attach active experiment labels to newly tracked events with event-size checks.
+
+
 All notable changes to this package are documented here.
 
 ## [Unreleased]

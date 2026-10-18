@@ -23,7 +23,7 @@ import UIKit
 /// on the main thread. That is why it is marked @unchecked.
 public final class RavensightClient: @unchecked Sendable {
     /// This SDK's version.
-    public static let sdkVersion = "0.4.0"
+    public static let sdkVersion = "0.4.1"
     /// The default host. "/api/v1" is appended for you.
     public static let defaultApiUrl = RavensightCore.defaultApiUrl
     /// Server hard limit on POST /track/batch.
@@ -69,6 +69,13 @@ public final class RavensightClient: @unchecked Sendable {
     private let installsLifecycleObservers: Bool
 
     var core: RavensightCore
+    private var configDocument: RavensightConfigDocument?
+    private var configScope = ""
+    private var configRequest: UUID?
+    private var configCallbacks: [(RavensightConfigResult) -> Void] = []
+    private var configSnapshot: [String: Any] = [:]
+    private var configSnapshotDevice = ""
+    private var configHandler: ((RavensightConfigResult) -> Void)?
     private var started = false
     /// False until the app has been in the foreground once since start().
     private var foreground = false
@@ -279,6 +286,7 @@ public final class RavensightClient: @unchecked Sendable {
                 "distribution ignored: it must be at most \(RavensightCore.maxDistributionLength) characters with no control characters."
             )
         }
+        refreshConfigCache()
         publishSnapshot()
         if inert { return }
 
@@ -1180,6 +1188,7 @@ public final class RavensightClient: @unchecked Sendable {
                 }
             case .sessionReady:
                 log("session ready")
+                fetchConfigOnQueue(nil)
                 if backgroundedAtMs != nil { writeBackgroundMarker() }
             case .sessionFailed(let reason):
                 log("session creation failed (\(reason)), will retry")
@@ -1193,11 +1202,83 @@ public final class RavensightClient: @unchecked Sendable {
         }
     }
 
+    /// Called on the main queue after each config fetch, including offline fallback.
+    public var onConfigReady: ((RavensightConfigResult) -> Void)? {
+        get { snapshotLock.lock(); defer { snapshotLock.unlock() }; return configHandler }
+        set { snapshotLock.lock(); configHandler = newValue; snapshotLock.unlock() }
+    }
+
+    /// Strict typed fallback. Supported defaults: Bool, Int, Double, String and JSON containers.
+    public func getConfig<T>(_ key: String, default fallback: T) -> T {
+        snapshotLock.lock(); defer { snapshotLock.unlock() }
+        guard snapshot.enabled, !snapshot.optedOut, snapshot.trackingEnabled, (isPlaytest || snapshot.deviceId == configSnapshotDevice), !["invalid_key", "no_key"].contains(snapshot.reason ?? "") else { return fallback }
+        return RavensightConfigDocument.get(configSnapshot[key], fallback: fallback)
+    }
+
+    public func fetchConfig(completion: ((RavensightConfigResult) -> Void)? = nil) {
+        workQueue.async { self.fetchConfigOnQueue(completion) }
+    }
+
+    private func refreshConfigCache() {
+        let scope = RavensightConfigDocument.scope(core.config)
+        if !core.isActive || core.config.deviceId.isEmpty {
+            configDocument = nil; configScope = ""
+        } else if scope != configScope {
+            configScope = scope; configDocument = nil
+            if !isPlaytest, defaults.string(forKey: "ravensight_config_scope") == scope,
+               let data = defaults.data(forKey: "ravensight_config_data") { configDocument = RavensightConfigDocument.parse(data) }
+        }
+        core.configExperiments = configDocument?.experiments ?? [:]
+        core.configExperimentDevice = core.config.deviceId
+        snapshotLock.lock(); configSnapshot = configDocument?.values ?? [:]; configSnapshotDevice = core.config.deviceId; snapshotLock.unlock()
+    }
+
+    private func fetchConfigOnQueue(_ completion: ((RavensightConfigResult) -> Void)?) {
+        refreshConfigCache()
+        guard core.isActive, !core.config.deviceId.isEmpty else {
+            if let completion = completion { DispatchQueue.main.async { completion(RavensightConfigResult(source: "default", values: [:])) } }
+            return
+        }
+        if let completion = completion { configCallbacks.append(completion) }
+        guard configRequest == nil else { return }
+        let request = UUID(); configRequest = request
+        let scope = configScope
+        let stamp = core.stamp
+        var url = URLComponents(string: core.config.apiUrl + "/ingest/config")!
+        url.queryItems = [URLQueryItem(name: "deviceId", value: core.config.deviceId), URLQueryItem(name: "platform", value: core.config.platform), URLQueryItem(name: "gameVersion", value: core.config.gameVersion)]
+        var headers = ["X-API-Key": core.config.ingestKey]
+        if let token = core.config.playtestToken { headers["X-Ravensight-Playtest"] = token }
+        if let etag = configDocument?.etag { headers["If-None-Match"] = etag }
+        let finish: (RavensightResponse) -> Void = { [weak self] response in
+            guard let self = self, self.configRequest == request else { return }
+            self.configRequest = nil
+            let callbacks = self.configCallbacks; self.configCallbacks = []
+            let valid = self.core.isActive && self.configScope == scope && !self.core.isStale(.batch(count: 0), since: stamp) && !self.core.isStale(.session, since: stamp)
+            var source = self.configDocument == nil ? "default" : "cache"
+            if valid, response.status == 200, let data = response.body, let fresh = RavensightConfigDocument.parse(data) {
+                self.configDocument = fresh; source = "network"
+                if !self.isPlaytest {
+                    self.defaults.set(fresh.data, forKey: "ravensight_config_data")
+                    self.defaults.set(scope, forKey: "ravensight_config_scope")
+                }
+                self.refreshConfigCache()
+            }
+            let result = RavensightConfigResult(source: valid ? source : "default", values: valid ? self.configDocument?.values ?? [:] : [:])
+            let handler = valid ? self.onConfigReady : nil
+            DispatchQueue.main.async { for callback in callbacks { callback(result) }; handler?(result) }
+        }
+        transport.send(RavensightRequest(method: "GET", url: url.string!, headers: headers)) { [weak self] response in
+            self?.workQueue.async { finish(response) }
+        }
+        workQueue.asyncAfter(deadline: .now() + 5) { finish(.networkFailure("config timeout")) }
+    }
+
     // MARK: Snapshot
 
     /// Call after every state change on the work queue: refreshes the
     /// snapshot, the timer and the status notification.
     func stateChanged() {
+        refreshConfigCache()
         updateSampling()
         persistQueueIfChanged()
         publishSnapshot()

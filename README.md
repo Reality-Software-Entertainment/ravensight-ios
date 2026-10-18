@@ -879,3 +879,32 @@ runs out of your data, see [docs/XCODE_SETUP.md](docs/XCODE_SETUP.md).
 ## License
 
 MIT. Copyright 2026 Reality Software Entertainment.
+
+## Remote configuration and experiments
+
+Held release: deploy the platform config endpoint before enabling this SDK.
+Config is public game data, never credentials. A successful session starts a
+background config fetch using the existing ingest key.
+
+```swift
+let client = Ravensight.start(ingestKey: "YOUR_PUBLISHABLE_INGEST_KEY")
+client.onConfigReady = { result in
+    let speed = client.getConfig("movement_speed", default: 4.0)
+    print(result.source, speed)
+}
+Ravensight.fetchConfig { result in print(result.source) }
+```
+
+Readiness and fetch completions run on the main queue. Sources are `network`,
+`cache` and `default`. Concurrent requests share a fetch; after five seconds the
+SDK resolves with cached values or defaults and discards any late response.
+Getters are thread-safe and support Bool, Int, Double, String, dictionaries and
+arrays, without coercing booleans or strings. Container values are copied.
+
+One persistent cache is scoped to endpoint, key, device, platform and build.
+Offline/malformed responses preserve it. Playtests do not persist config.
+Consent and identity changes discard late results. Active experiments add
+`rs_exp_<key>` labels to newly tracked events, including typed helpers. Already
+queued events keep their original data. A fresh config response uses one ordinary
+event; an unchanged ETag is free. Keep safe defaults for first launch and offline
+play. Config calls and cached values are unavailable while tracking is disabled.

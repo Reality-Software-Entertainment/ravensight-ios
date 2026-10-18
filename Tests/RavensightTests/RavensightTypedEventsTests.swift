@@ -209,7 +209,7 @@ final class RavensightTypedEventsTests: XCTestCase {
         let body = transport.requests(suffix: "/session").first?.body
         let object = body.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
         XCTAssertEqual(object?["sdk"] as? String, "ios/\(Ravensight.sdkVersion)")
-        XCTAssertEqual(Ravensight.sdkVersion, "0.4.0")
+        XCTAssertEqual(Ravensight.sdkVersion, "0.4.1")
     }
 
     // MARK: Health
