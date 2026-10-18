@@ -16,3 +16,8 @@ owner approval. Older README test counts describe their earlier branch runs;
 this file records the combined candidate.
 
 Remote config wave: full Swift package suite passed, 179 tests with zero failures. New tests cover strict numeric/boolean fallback, ETags, exposure labels, cache restoration, reset/opt-out response races and request deduplication. Version 0.4.1 remains held. Physical-device and live API checks are not implied.
+
+Config identifier compatibility audit: 4 focused Swift config tests passed.
+Config property keys reject constructor/prototype, including nested JSON properties.
+Experiment keys and variant labels may use those words as string values, matching
+the server contract. Regression coverage distinguishes those cases. Publishing remains held.

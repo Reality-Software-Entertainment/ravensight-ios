@@ -20,6 +20,13 @@ final class RavensightRemoteConfigTests: XCTestCase {
         wait(for: [ready], timeout: 2)
         return result
     }
+    func testReservedPropertyNamesAndExperimentStringLabels() {
+        for word in ["constructor", "prototype"] {
+            XCTAssertNil(RavensightConfigDocument.parse(document([word: 1])))
+            XCTAssertNil(RavensightConfigDocument.parse(document(["nested": [word: 1]])))
+            XCTAssertNotNil(RavensightConfigDocument.parse(document([:], experiments: [["key": word, "variant": word]])))
+        }
+    }
     func testTypedFallbackValidationAndContainerCopies() {
         let doc = RavensightConfigDocument.parse(document())!
         XCTAssertEqual(RavensightConfigDocument.get(doc.values["speed"], fallback: 0), 3)

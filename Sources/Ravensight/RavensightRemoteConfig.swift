@@ -21,7 +21,7 @@ struct RavensightConfigDocument {
               let rows = doc["experiments"] as? [[String: Any]], rows.count <= 10,
               let etag = doc["etag"] as? String, matches(etag, "^\"[a-f0-9]{64}\"$") else { return nil }
         for (key, value) in values {
-            guard matches(key, "^[a-z][a-z0-9_]{0,63}$"), safe(value),
+            guard matches(key, "^[a-z][a-z0-9_]{0,63}$"), !["constructor", "prototype"].contains(key), safe(value),
                   let encoded = try? JSONSerialization.data(withJSONObject: value, options: .fragmentsAllowed), encoded.count <= 8192 else { return nil }
         }
         var experiments: [String: String] = [:]
