@@ -272,7 +272,12 @@ enum RavensightCrashFile {
         guard let data = try? JSONSerialization.data(withJSONObject: encoded) else { return }
         try? FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? data.write(to: url, options: [.atomic])
+        guard (try? data.write(to: url, options: [.atomic])) != nil else { return }
+        // A pending crash record has no business in a device backup.
+        var file = url
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try? file.setResourceValues(values)
     }
 
     static func load(_ url: URL) -> [RavensightCapture] {
