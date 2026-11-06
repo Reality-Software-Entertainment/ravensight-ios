@@ -3,8 +3,8 @@
 Official Swift SDK for [Ravensight](https://ravensight.io) player analytics.
 
 Sessions, batched events, an offline queue (optionally persisted), rate
-limit handling, a server side kill switch, player feedback and Player
-Reports with screenshots, in one Swift package and no third party
+limit handling, a server side kill switch, player feedback, Player
+Reports with screenshots and automatic error capture, in one Swift package and no third party
 dependencies.
 
 * API base: `https://api.ravensight.io` (the SDK appends `/api/v1`)
@@ -192,6 +192,7 @@ Ravensight.submitFeedback("The boss fight drags", category: "suggestion", rating
 | `sessionTimeout` | `1800` | iOS. Seconds in the background after which the session ends. |
 | `playtestToken` | nil | Ravensight Playtest token. Nil reads `RAVENSIGHT_PLAYTEST_TOKEN` from the launch environment. |
 | `playtestRunId` | nil | Ravensight Playtest run id. Nil reads `RAVENSIGHT_PLAYTEST_RUN_ID`. |
+| `captureErrors` | `true` | Captures crashes automatically. `false` opts this build out. See "Automatic error capture". |
 | `verboseLogging` | `false` | Logs SDK activity to the console. |
 
 ## Automatic events
@@ -374,6 +375,82 @@ process footprint) and `rs_boot_ms` (process start to `start`). iOS has no
 reliable exit callback, so background entry is the send point. With no
 samples nothing is sent, and it is never sent per second. On macOS the option
 does nothing.
+
+## Automatic error capture
+
+Unreleased. Errors in a live game are easy to miss, so the SDK reports
+crashes on its own. It is on by default and installs nothing until there
+is an ingest key, the player's consent (with `consent = .optIn`, their
+yes), and the game's error capture switch is not off.
+
+What is captured, each as one ordinary `error` event on your event meter:
+
+* **An Objective-C exception that ends the app** (`NSRangeException` and
+  the like). A handler chained to any handler installed before it saves
+  the exception's name, reason and call stack symbols, scrubbed, to a small
+  file under Application Support, then always calls the earlier handler.
+  The next launch sends it with `rs_source` `crash`, `rs_severity`
+  `critical`, the name as `rs_error_type`, and the time it happened.
+* **Swift traps, bad memory access and other crashes** never reach that
+  handler. The system records them, and on iOS 15 or newer delivers its
+  crash report through MetricKit on the next launch. The SDK sends each one
+  once, as a short description (`Crashed with SIGTRAP (EXC_BREAKPOINT)`,
+  the signal as `rs_error_type`) and at most 12 frames of the crashed
+  thread as `binary +offset`, never the full call stack tree. The SDK
+  installs no signal handler.
+* **`Ravensight.log(message, level: .error)`** is captured with `rs_source`
+  `log` at `warning`.
+
+`Ravensight.trackError` is unchanged: it sends what you wrote, with no
+`rs_source`, and is never blocked by the switch.
+
+### What is never sent
+
+Before anything is saved or queued, messages, stacks and the trail are
+scrubbed on the device with the server's rules: emails become `[email]`,
+bearer tokens, JWTs, `gt_` keys and long token-like runs with a digit
+become `[token]` (a file path is kept), IP addresses become `[ip]`, home
+folders become `~`, and a URL loses its query, fragment and any user and
+password. Messages are cut to 200 characters and stacks to 2,000. The
+SDK's own requests and log lines are never captured. Swift symbol names of
+32 or more characters that contain a digit read as tokens under these rules
+and are scrubbed too; symbol files are a later step.
+
+### Limits on the device
+
+Per session: at most 30 captures, 3 of the same error, 6 a minute, and 10
+with a trail. Over a limit the capture is dropped silently. Captures made
+before Ravensight's first answer (at most 5) are held in memory and sent
+only once the answer says capture is on. Gameplay events keep their place
+in the queue ahead of errors.
+
+### The trail
+
+When the game's trail switch is on in the dashboard (off by default), an
+error carries the last 20 lines before it as `rs_trail`: your `track` calls
+by name and your `Ravensight.log` lines, each with the milliseconds since
+the session started. iOS gives an app no way to read its own other logs,
+so those two are the whole trail. It is kept in memory only and sent only
+with an error.
+
+```swift
+Ravensight.log("loading boss arena")              // .info by default
+Ravensight.log("save failed", level: .error)      // also captured
+```
+
+### Turning it off
+
+* For one build: `config.captureErrors = false`.
+* For the whole game, without a new build: switch error capture off in the
+  game's settings on the dashboard. The SDK reads it from Ravensight's
+  answer and removes its hooks.
+* The player's opt-out, `stopAllTelemetry()` and `resetDeviceId()` remove
+  or reset it too; an opt-out deletes a saved crash file unsent.
+
+A synthetic (Playtest) run does not install the crash handlers, since it
+never writes a file. Verified so far: unit tests with the handler called
+directly and the MetricKit payload faked. A real crash on a device against
+a local API has not been run yet.
 
 ## Startup outcome
 
@@ -725,7 +802,8 @@ found. Leave both unset in a build for real players.
 | Public builds | Yes, since 0.4.0: `gt_pub_` keys, inert without a key (`optional`), `consent = .optIn`, `distribution`, `rs_event_id`, the 8 KB cap and a refused key ending the run. See "Public builds". |
 | Journeys | Not in this SDK. There is no journey API here; when your Ravensight project has journeys enabled, the server builds them from the level events you track (see "Levels and deaths"). |
 | Design suggestions | Experimental: `fetchSuggestions`. |
-| Screen capture, a report form, crash reporting, push, purchases | Not in this SDK. |
+| Error capture | Yes, unreleased: Objective-C exceptions and system crash reports, sent on the next launch, plus `Ravensight.log`. See "Automatic error capture". |
+| Screen capture, a report form, push, purchases | Not in this SDK. |
 
 ## Narrative sample
 
@@ -857,10 +935,22 @@ app's privacy report. It declares:
 * `NSPrivacyTracking`: false, with no tracking domains.
 * `NSPrivacyAccessedAPITypes`: `NSPrivacyAccessedAPICategoryUserDefaults`
   with reason `CA92.1`. The SDK reads and writes its own keys (device id,
-  opt-out, opt-in, background marker) and nothing else. The persisted queue file is
+  opt-out, opt-in, background marker, the crash reports already sent) and
+  nothing else. The persisted queue file is
   written and read without any API that needs a declared reason.
 * `NSPrivacyCollectedDataTypes`: Device ID and Product Interaction, each not
-  linked to the player, not used for tracking, purpose Analytics.
+  linked to the player, not used for tracking, purpose Analytics. Crash Data
+  and Other Diagnostic Data (error capture's messages, stacks and trail),
+  each not linked to the player, not used for tracking, purposes Analytics
+  and App Functionality.
+
+Why not linked: the only identifier the SDK sends is the random per-install
+`dev_` id. It is not an account, email, or any id your app or another
+company holds, and the SDK never joins it to one. If your game links
+Ravensight data to a player's account (for example by sending an account id
+in event data), declare these types as linked in your own manifest.
+Turn off `captureErrors` and you can drop Crash Data and Other Diagnostic
+Data from your store form.
 
 A game that sends gameplay events and nothing else can declare Device ID and
 Product Interaction as not linked to the player and not used for tracking,

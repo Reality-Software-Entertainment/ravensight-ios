@@ -12,6 +12,32 @@ All notable changes to this package are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Automatic error capture, on by default (`captureErrors`, default `true`).
+  Installed only with a key, the player's consent and the game's error
+  capture switch not off; the switch comes from the settings and session
+  answers (`errorCapture: { enabled, trail }`).
+- An Objective-C exception that ends the app is saved, scrubbed, by an
+  uncaught exception handler chained to the earlier one, and sent on the
+  next launch as one `error` event (`rs_source` `crash`, `critical`).
+- Swift traps and other crashes are read from MetricKit crash diagnostics
+  on the next launch and sent once each, as a short description and at most
+  12 frames. No signal handler is installed.
+- `Ravensight.log(_:level:)`: a trail line, and at `.error` a captured
+  `warning` with `rs_source` `log`. `isCapturingErrors`.
+- Device caps per session (30 captures, 3 per error, 6 a minute, 10
+  trails), a boot hold of 5 until the first answer, and the server's scrub
+  rules on the device, checked against the shared scrub vectors.
+- Privacy manifest: Crash Data and Other Diagnostic Data, not linked, not
+  tracking, purposes Analytics and App Functionality.
+
+### Changed
+
+- A `413` on a batch is handled like a `400` (split, then drop the one bad
+  event) instead of being retried as is.
+- A full queue drops an automatic error before any gameplay event.
+
 ## [0.4.0] - 2026-10-16
 
 For games whose builds or source anyone can download. A game that passes
