@@ -90,6 +90,13 @@ public struct RavensightConfiguration: Sendable {
     /// RAVENSIGHT_PLAYTEST_RUN_ID launch environment variable.
     public var playtestRunId: String?
 
+    /// Capture errors automatically: an Objective-C exception that ends the
+    /// app, and the system's crash reports (Swift traps and signals), both
+    /// sent on the next launch as one error event each. On by default; false
+    /// opts this build out. Nothing is installed without a key, before the
+    /// player's consent, or while the game's error capture switch is off.
+    public var captureErrors: Bool = true
+
     /// Log SDK activity with print. Off by default. A key refusal, the kill
     /// switch and a playtest stop are printed once whatever this says.
     public var verboseLogging: Bool = false

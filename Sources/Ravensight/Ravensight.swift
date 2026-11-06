@@ -113,6 +113,19 @@ public enum Ravensight {
         shared?.getConfig(key, default: fallback) ?? fallback
     }
 
+    /// Adds a line to the trail sent with the next captured error, when the
+    /// game's trail switch is on. An .error line is also captured as an
+    /// error event (rs_source "log", severity "warning"). A no-op before
+    /// start() and while inert.
+    public static func log(_ message: String, level: RavensightLogLevel = .info) {
+        shared?.log(message, level: level)
+    }
+
+    /// True while automatic error capture is installed. False before start().
+    public static var isCapturingErrors: Bool {
+        return shared?.isCapturingErrors ?? false
+    }
+
     /// Sends queued events now, bypassing the backoff window once.
     public static func flush(completion: (() -> Void)? = nil) {
         guard let client = shared else {

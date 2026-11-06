@@ -36,6 +36,13 @@ public final class RavensightClient: @unchecked Sendable {
     static let markerKey = "ravensight_background_marker"
     /// The player's yes in consent = .optIn mode.
     static let optInKey = "ravensight_optin"
+    /// Crash diagnostics already handled, so each is sent once.
+    static let crashSeenKey = "ravensight_crash_seen"
+    /// When the last few Objective-C exception crashes happened, so the
+    /// system's report of the same crash is not sent a second time.
+    static let exceptionTimesKey = "ravensight_exception_times"
+    /// Captures held in memory before the first settings or session answer.
+    static let maxBootErrors = 5
     /// The longest a quit is held for the final flush.
     static let quitHoldSeconds: TimeInterval = 1.5
 
@@ -109,6 +116,24 @@ public final class RavensightClient: @unchecked Sendable {
     private var warned: Set<String> = []
     private var lastNotifiedReason: String?
 
+    // Automatic error capture. Work queue only, except metricSubscriber
+    // (main thread only).
+    /// False in tests: no process-wide exception handler, no MetricKit.
+    private let installsCrashSources: Bool
+    /// Where an Objective-C exception is written as the app dies. Nil while
+    /// inert and in a synthetic (playtest) run, which never touch a file.
+    private let crashFileURL: URL?
+    private var errorHooked = false
+    private var crashFileChecked = false
+    private var bootErrors: [RavensightCapture] = []
+    private var errorCaps: RavensightErrorCaps
+    private var trail = RavensightTrail()
+    private var trailStartMs: Int64
+    private var metricSubscriber: AnyObject?
+    /// Captures queued and captures dropped by a device cap, this run.
+    private(set) var errorsCaptured = 0
+    private(set) var errorsCapped = 0
+
     /// The persisted queue, nil unless persistQueue is on in a normal session.
     private let queueStore: RavensightQueueStore?
     /// Where this key's queue file lives (or would), whatever persistQueue
@@ -153,6 +178,7 @@ public final class RavensightClient: @unchecked Sendable {
         /// The durable id. Never a synthetic one.
         var deviceId = ""
         var stats = RavensightStats()
+        var capturingErrors = false
     }
 
     private struct Waiter {
@@ -166,7 +192,8 @@ public final class RavensightClient: @unchecked Sendable {
         self.init(
             configuration: configuration,
             transport: RavensightURLSessionTransport(timeout: configuration.requestTimeout),
-            now: nil
+            now: nil,
+            installsCrashSources: true
         )
     }
 
@@ -182,7 +209,8 @@ public final class RavensightClient: @unchecked Sendable {
         isBackgroundLaunch: (() -> Bool)? = nil,
         installsLifecycleObservers: Bool = true,
         queueDirectory: URL? = nil,
-        random: (() -> Double)? = nil
+        random: (() -> Double)? = nil,
+        installsCrashSources: Bool = false
     ) {
         self.configuration = configuration
         self.transport = transport
@@ -192,6 +220,10 @@ public final class RavensightClient: @unchecked Sendable {
         self.isBackgroundLaunch = isBackgroundLaunch ?? RavensightClient.launchedInBackground
         self.installsLifecycleObservers = installsLifecycleObservers
         self.consent = configuration.consent
+        self.installsCrashSources = installsCrashSources
+        let startMs = clock()
+        self.errorCaps = RavensightErrorCaps(nowMs: startMs)
+        self.trailStartMs = startMs
 
         // No key: inert for the run. Nothing is read beyond the player's
         // saved choice, nothing is written, no file is touched, no request
@@ -232,6 +264,9 @@ public final class RavensightClient: @unchecked Sendable {
             self.playtestDeviceId = nil
         }
         self.queueFileURL = inert ? nil : RavensightQueueStore.defaultFileURL(
+            ingestKey: configuration.ingestKey, directory: queueDirectory
+        )
+        self.crashFileURL = (inert || token != nil) ? nil : RavensightCrashFile.defaultURL(
             ingestKey: configuration.ingestKey, directory: queueDirectory
         )
         if configuration.persistQueue && token == nil && !inert {
@@ -313,6 +348,12 @@ public final class RavensightClient: @unchecked Sendable {
     }
 
     deinit {
+        #if canImport(ObjectiveC)
+        if errorHooked, let url = crashFileURL { RavensightExceptionHook.deactivate(fileURL: url) }
+        #endif
+        if let subscriber = metricSubscriber {
+            DispatchQueue.main.async { RavensightClient.stopSubscriber(subscriber) }
+        }
         if let source = frameSource {
             DispatchQueue.main.async { source.invalidate() }
         }
@@ -556,6 +597,7 @@ public final class RavensightClient: @unchecked Sendable {
                     ))
                 }
                 self.core.invalidateSession()
+                self.resetErrorSession()
                 self.startedQueued = false
                 self.healthSent = false
                 self.healthSampler.reset()
@@ -709,6 +751,7 @@ public final class RavensightClient: @unchecked Sendable {
         }
         workQueue.async {
             if self.core.track(name: name, data: stamped ?? data, nowMs: self.now(), eventId: eventId) {
+                self.addTrailLine("track", name)
                 self.stateChanged()
                 if self.core.pendingEvents.count >= RavensightCore.maxBatchSize {
                     self.pump()
@@ -984,6 +1027,7 @@ public final class RavensightClient: @unchecked Sendable {
         workQueue.async {
             self.core.replaceDeviceId(fresh)
             self.deleteQueueFile()
+            self.resetErrorSession()
             self.stateChanged()
         }
         return fresh
@@ -1063,6 +1107,171 @@ public final class RavensightClient: @unchecked Sendable {
     /// The last delivery attempt: accepted, failed(status) or offline, with
     /// its time. Nil before the first attempt.
     public var lastDelivery: RavensightDelivery? { return readSnapshot().stats.lastDelivery }
+
+    /// True while automatic error capture is installed: a key, the player's
+    /// consent, captureErrors on and the game's switch not off.
+    public var isCapturingErrors: Bool { return readSnapshot().capturingErrors }
+
+    /// Adds a line to the trail sent with the next captured error (only
+    /// when the game's trail switch is on; kept in memory, never sent on
+    /// its own). An .error line is also captured as an error event with
+    /// rs_source "log" and severity "warning". The SDK cannot read your
+    /// app's other logs, so this and your track calls are the whole trail.
+    public func log(_ message: String, level: RavensightLogLevel) {
+        if isInert { return }
+        workQueue.async {
+            self.addTrailLine(level.rawValue, message)
+            if level == .error,
+               self.capture(RavensightCapture(source: "log", severity: "warning", message: message)) {
+                self.stateChanged()
+            }
+        }
+    }
+
+    // MARK: Error capture (work queue)
+
+    /// Installs or removes the crash sources to match the state, and sends
+    /// or discards the captures held before the first answer.
+    private func syncErrorCapture() {
+        let want = configuration.captureErrors && started && core.isActive && core.errorCaptureEnabled
+        if want && !errorHooked {
+            errorHooked = true
+            crashFileChecked = true
+            installCrashSources()
+            loadCrashFile()
+            log("error capture installed")
+        } else if !want && errorHooked {
+            errorHooked = false
+            trail.clear()
+            bootErrors.removeAll()
+            removeCrashSources()
+            RavensightCrashFile.delete(crashFileURL)
+            log("error capture removed")
+        } else if !want && started && !crashFileChecked {
+            // Off from the start (captureErrors false, opted out, stopped):
+            // a crash an earlier launch saved is not kept.
+            crashFileChecked = true
+            RavensightCrashFile.delete(crashFileURL)
+        }
+        if !core.errorTrailEnabled && !trail.lines.isEmpty { trail.clear() }
+        if errorHooked && core.errorCaptureAnswered && !bootErrors.isEmpty {
+            let held = bootErrors
+            bootErrors = []
+            for capture in held { _ = self.capture(capture) }
+        }
+    }
+
+    private func installCrashSources() {
+        guard installsCrashSources, !isPlaytest else { return }
+        #if canImport(ObjectiveC)
+        if let url = crashFileURL { RavensightExceptionHook.activate(fileURL: url) }
+        #endif
+        #if canImport(MetricKit) && (os(iOS) || os(macOS))
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.metricSubscriber == nil else { return }
+            let subscriber = RavensightMetricKitSubscriber { [weak self] diagnostics in
+                self?.workQueue.async { self?.receiveCrashDiagnostics(diagnostics) }
+            }
+            subscriber.start()
+            self.metricSubscriber = subscriber
+        }
+        #endif
+    }
+
+    private func removeCrashSources() {
+        guard installsCrashSources, !isPlaytest else { return }
+        #if canImport(ObjectiveC)
+        RavensightExceptionHook.deactivate(fileURL: crashFileURL)
+        #endif
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, let subscriber = self.metricSubscriber else { return }
+            self.metricSubscriber = nil
+            RavensightClient.stopSubscriber(subscriber)
+        }
+    }
+
+    private static func stopSubscriber(_ subscriber: AnyObject) {
+        #if canImport(MetricKit) && (os(iOS) || os(macOS))
+        (subscriber as? RavensightMetricKitSubscriber)?.stop()
+        #endif
+    }
+
+    /// The Objective-C exception the last launch died of, if any: read,
+    /// deleted, and captured (held until the first answer).
+    private func loadCrashFile() {
+        guard let url = crashFileURL else { return }
+        let reports = RavensightCrashFile.load(url)
+        RavensightCrashFile.delete(url)
+        guard !reports.isEmpty else { return }
+        var times = defaults.array(forKey: RavensightClient.exceptionTimesKey) as? [Int64] ?? []
+        times.append(contentsOf: reports.compactMap { $0.atSec })
+        defaults.set(Array(times.suffix(RavensightCrashFile.maxReports)), forKey: RavensightClient.exceptionTimesKey)
+        for report in reports { _ = capture(report) }
+    }
+
+    /// Crash diagnostics from the system: each sent once. A SIGABRT within a
+    /// minute of an exception this SDK already saved is that same crash.
+    func receiveCrashDiagnostics(_ diagnostics: [RavensightCrashDiagnostic]) {
+        guard errorHooked else { return }
+        var seen = defaults.stringArray(forKey: RavensightClient.crashSeenKey) ?? []
+        let exceptionTimes = defaults.array(forKey: RavensightClient.exceptionTimesKey) as? [Int64] ?? []
+        var queued = false
+        for diagnostic in diagnostics {
+            let identity = diagnostic.identity
+            guard !seen.contains(identity) else { continue }
+            seen.append(identity)
+            let sameAsException = diagnostic.signal == 6 && exceptionTimes.contains {
+                $0 >= diagnostic.beginSec - 60 && $0 <= diagnostic.endSec + 60
+            }
+            if sameAsException { continue }
+            if capture(diagnostic.capture) { queued = true }
+        }
+        defaults.set(Array(seen.suffix(50)), forKey: RavensightClient.crashSeenKey)
+        if queued || !bootErrors.isEmpty { stateChanged() }
+    }
+
+    /// Queues one automatic capture after the boot hold, the device caps
+    /// and the scrub. True when it was queued; over a cap it is dropped
+    /// silently.
+    @discardableResult
+    func capture(_ capture: RavensightCapture) -> Bool {
+        guard errorHooked, core.isActive else { return false }
+        if !core.errorCaptureAnswered {
+            if bootErrors.count < RavensightClient.maxBootErrors {
+                bootErrors.append(capture)
+            } else {
+                errorsCapped += 1
+            }
+            return false
+        }
+        let nowMs = now()
+        let built = RavensightErrorText.eventData(capture, trail: nil)
+        guard errorCaps.admit(key: built.key, nowMs: nowMs) else {
+            errorsCapped += 1
+            return false
+        }
+        var data = built.data
+        if core.errorTrailEnabled && !trail.lines.isEmpty && errorCaps.takeTrail() {
+            data["rs_trail"] = trail.text
+        }
+        guard core.track(name: "error", data: data, nowMs: nowMs, atSec: capture.atSec) else { return false }
+        errorsCaptured += 1
+        return true
+    }
+
+    /// One trail line, when capture is installed and the trail is on.
+    private func addTrailLine(_ level: String, _ text: String) {
+        guard errorHooked, core.errorTrailEnabled else { return }
+        trail.add(level: level, text: text, elapsedMs: now() - trailStartMs)
+    }
+
+    /// A new session (or a new identity) gets fresh caps and an empty trail.
+    private func resetErrorSession() {
+        let nowMs = now()
+        errorCaps = RavensightErrorCaps(nowMs: nowMs)
+        trail.clear()
+        trailStartMs = nowMs
+    }
 
     /// Runs a block on the work queue after everything already queued there.
     /// Tests use it as a barrier.
@@ -1278,6 +1487,7 @@ public final class RavensightClient: @unchecked Sendable {
     /// Call after every state change on the work queue: refreshes the
     /// snapshot, the timer and the status notification.
     func stateChanged() {
+        syncErrorCapture()
         refreshConfigCache()
         updateSampling()
         persistQueueIfChanged()
@@ -1317,7 +1527,8 @@ public final class RavensightClient: @unchecked Sendable {
             queuedEventCount: core.pendingCount,
             reason: core.statusReason,
             deviceId: snapshot.deviceId,
-            stats: stats
+            stats: stats,
+            capturingErrors: errorHooked
         )
         snapshotLock.unlock()
     }
