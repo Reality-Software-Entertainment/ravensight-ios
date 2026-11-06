@@ -1443,18 +1443,18 @@ public final class RavensightClient: @unchecked Sendable {
 
     // MARK: Ads and attribution
 
-    /// One ad lifecycle step as an rs_ad event (name overrides). Refused
+    /// One ad lifecycle step as an rs_ad event (the contract's fixed name). Refused
     /// locally, returning false with nothing queued, when the ad breaks the
     /// contract: no network, an unknown format or result, a revenue that is
     /// not a digit string, revenue without a three letter currency, or
     /// revenue on a result other than shown.
     @discardableResult
-    public func trackAd(_ ad: RavensightAd, name: String = "rs_ad") -> Bool {
+    public func trackAd(_ ad: RavensightAd) -> Bool {
         guard let data = ad.eventData() else {
             warnOnce("ad_refused", "ad event refused locally: check network, format, result, and that revenue comes with a currency on a shown result.")
             return false
         }
-        return track(name, data: data)
+        return track("rs_ad", data: data)
     }
 
     /// trackAd with result shown and revenue in micros of currency.
