@@ -343,14 +343,14 @@ final class RavensightPublicBuildTests: XCTestCase {
         return core.nextAttemptAtMs - nowMs
     }
 
-    func testBackoffJitterStaysWithinTwentyPercent() {
-        XCTAssertEqual(firstBackoffWait(random: 0), 8_000)
-        XCTAssertEqual(firstBackoffWait(random: 0.5), 10_000, "a fixed 0.5 is the old backoff exactly")
-        XCTAssertEqual(firstBackoffWait(random: 0.999_999), 12_000, accuracy: 1)
+    func testBackoffJitterIsAFactorFromHalfToOne() {
+        XCTAssertEqual(firstBackoffWait(random: 0), 5_000)
+        XCTAssertEqual(firstBackoffWait(random: 0.5), 7_500)
+        XCTAssertEqual(firstBackoffWait(random: 0.999_999), 10_000, accuracy: 1)
         for _ in 0..<200 {
             let wait = firstBackoffWait(random: Double.random(in: 0..<1))
-            XCTAssertGreaterThanOrEqual(wait, 8_000)
-            XCTAssertLessThanOrEqual(wait, 12_000)
+            XCTAssertGreaterThanOrEqual(wait, 5_000)
+            XCTAssertLessThanOrEqual(wait, 10_000)
         }
     }
 
@@ -448,7 +448,7 @@ final class RavensightPublicBuildTests: XCTestCase {
                 RavensightEvent(name: "kept", data: ["rs_event_id": "saved-id-1"], timestamp: 1),
                 RavensightEvent(name: "from_0_3", data: [:], timestamp: 2),
             ],
-            sessionToken: nil, expiresAtMs: 0, nowMs: nowMs
+            nowMs: nowMs
         )
         let ids = core.pendingEvents.compactMap { $0.data["rs_event_id"] as? String }
         XCTAssertEqual(ids.count, 2)

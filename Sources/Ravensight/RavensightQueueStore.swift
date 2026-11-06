@@ -1,12 +1,15 @@
 import Foundation
 
-/// The opt-in persisted queue (RavensightConfiguration.persistQueue): one
-/// small JSON file under Application Support, rewritten atomically whenever
-/// the queue changes and read once when the client is created.
+/// The persisted queue (RavensightConfiguration.persistQueue, on by default):
+/// one small JSON file under Application Support, rewritten atomically
+/// whenever the queue changes and read once when the client is created.
 ///
-/// Each group of events remembers the session it was queued under, so events
-/// a force quit left behind can go out under that same session on the next
-/// launch while it is still valid.
+/// Format version 2 (docs/sdk/DELIVERY_CONTRACT.md section 2): each group of
+/// events carries the origin of the session it was tracked under, exactly as
+/// the /session answer gave it, so events a crash, a kill or a lost network
+/// left behind are filed under their own session, build and platform when
+/// the next launch sends them. Version 1 files are read as groups without an
+/// origin. Session tokens and signing secrets are never written.
 ///
 /// Only touched on the client's work queue (and in the initializer, before
 /// the client is shared), so it needs no lock of its own.
@@ -16,13 +19,26 @@ final class RavensightQueueStore {
     /// Events older than this are not restored: the server ignores events
     /// older than 90 days.
     static let maxAgeSeconds: Int64 = 89 * 86_400
-    static let formatVersion = 1
+    static let formatVersion = 2
 
     struct Group {
-        var sessionToken: String?
-        /// Unix milliseconds, 0 when there is no session.
-        var expiresAtMs: Int64
+        /// The session's origin as received, nil when it had none.
+        var origin: [String: Any]?
         var events: [RavensightEvent]
+    }
+
+    /// Consecutive events with the same origin, in queue order.
+    static func groups(_ events: [RavensightEvent]) -> [Group] {
+        var out: [Group] = []
+        for event in events {
+            let session = event.origin?["session"] as? String
+            if let last = out.last, (last.origin?["session"] as? String) == session {
+                out[out.count - 1].events.append(event)
+            } else {
+                out.append(Group(origin: event.origin, events: [event]))
+            }
+        }
+        return out
     }
 
     let fileURL: URL
@@ -61,30 +77,31 @@ final class RavensightQueueStore {
     func load(nowMs: Int64) -> (groups: [Group], dropped: Int) {
         guard let data = try? Data(contentsOf: fileURL),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              (object["version"] as? NSNumber)?.intValue == RavensightQueueStore.formatVersion,
+              let version = (object["version"] as? NSNumber)?.intValue, version == 1 || version == 2,
               let groups = object["groups"] as? [[String: Any]] else { return ([], 0) }
         var dropped = 0
-        let oldest = nowMs / 1000 - RavensightQueueStore.maxAgeSeconds
+        // Version 1 stored unix seconds; version 2 stores milliseconds.
+        let scale: Int64 = version == 1 ? 1000 : 1
+        let oldest = nowMs - RavensightQueueStore.maxAgeSeconds * 1000
         var total = 0
         var result: [Group] = []
         for raw in groups {
-            let token = raw["sessionToken"] as? String
-            let expiresAt = (raw["expiresAtMs"] as? NSNumber)?.int64Value ?? 0
+            let origin = version == 2 ? raw["origin"] as? [String: Any] : nil
             let rawEvents = raw["events"] as? [[String: Any]] ?? []
             var events: [RavensightEvent] = []
             for entry in rawEvents {
                 guard let name = entry["event"] as? String, !name.isEmpty,
-                      let timestamp = (entry["timestamp"] as? NSNumber)?.int64Value,
-                      timestamp >= oldest else {
+                      let stored = (entry["timestamp"] as? NSNumber)?.int64Value,
+                      stored * scale >= oldest else {
                     dropped += 1
                     continue
                 }
                 let payload = entry["data"] as? [String: Any] ?? [:]
-                events.append(RavensightEvent(name: name, data: payload, timestamp: timestamp))
+                events.append(RavensightEvent(name: name, data: payload, timestamp: stored * scale, origin: origin, restored: true))
             }
             total += events.count
             if !events.isEmpty {
-                result.append(Group(sessionToken: token, expiresAtMs: expiresAt, events: events))
+                result.append(Group(origin: origin, events: events))
             }
         }
         // Keep the newest maxEvents across all groups.
@@ -124,10 +141,9 @@ final class RavensightQueueStore {
             "version": RavensightQueueStore.formatVersion,
             "groups": trimmed.map { group -> [String: Any] in
                 var entry: [String: Any] = [
-                    "expiresAtMs": group.expiresAtMs,
-                    "events": group.events.map { $0.payload() },
+                    "events": group.events.map { ["event": $0.name, "data": $0.data, "timestamp": $0.timestamp] as [String: Any] },
                 ]
-                if let token = group.sessionToken { entry["sessionToken"] = token }
+                if let origin = group.origin { entry["origin"] = origin }
                 return entry
             },
         ]

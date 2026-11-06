@@ -37,6 +37,7 @@ final class RavensightReportTests: XCTestCase {
         configuration.apiUrl = "https://fake.test"
         configuration.trackLifecycleEvents = false
         configuration.flushInterval = 0
+        configuration.persistQueue = false
         let client = RavensightClient(
             configuration: configuration,
             transport: transport,

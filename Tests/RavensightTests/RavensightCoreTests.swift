@@ -15,7 +15,7 @@ final class RavensightCoreTests: XCTestCase {
             deviceId: "dev_test",
             maxQueueSize: maxQueueSize
         ))
-        core.random = { 0.5 } // no jitter: the backoff tests read exact waits
+        core.random = { 1.0 } // factor 1: the backoff tests read exact waits
         return core
     }
 
@@ -24,7 +24,8 @@ final class RavensightCoreTests: XCTestCase {
     }
 
     private func decode(_ data: Data?) -> [String: Any] {
-        guard let data = data else { return [:] }
+        guard var data = data else { return [:] }
+        if data.first == 0x1f, let plain = RavensightWire.gunzip(data) { data = plain }
         return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
     }
 
@@ -258,7 +259,7 @@ final class RavensightCoreTests: XCTestCase {
         let events = decode(request.body)["events"] as? [[String: Any]]
         let event = events?.first
         XCTAssertEqual(event?["event"] as? String, "level_completed")
-        XCTAssertEqual(event?["timestamp"] as? Int64, nowMs / 1000)
+        XCTAssertEqual(event?["timestamp"] as? Int64, nowMs, "milliseconds, set when tracked")
         let data = event?["data"] as? [String: Any]
         XCTAssertEqual(data?["level"] as? Int, 3)
         XCTAssertEqual(data?["hard"] as? Bool, true)
@@ -307,10 +308,8 @@ final class RavensightCoreTests: XCTestCase {
         core.track(name: "event", data: nil, nowMs: nowMs)
         openSession(&core, token: "sess_1")
         expectBatch(&core, count: 1, respond: 401)
+        // One re open is allowed; the second 401 in a row backs off.
         openSession(&core, token: "sess_2")
-        expectBatch(&core, count: 1, respond: 401)
-        // Two re opens in a row are allowed; the third 401 backs off.
-        openSession(&core, token: "sess_3")
         expectBatch(&core, count: 1, respond: 401)
 
         guard case .wait = core.nextStep(nowMs: nowMs) else {
@@ -431,12 +430,13 @@ final class RavensightCoreTests: XCTestCase {
         }
         openSession(&core)
 
+        let tooLarge = jsonBody(["error": "batch_too_large"])
         for expected in [50, 25, 12, 6, 3, 1] {
-            let (_, effects) = expectBatch(&core, count: expected, respond: 400)
+            let (_, effects) = expectBatch(&core, count: expected, respond: 400, body: tooLarge)
             if expected > 1 {
                 XCTAssertEqual(effects, [])
             } else {
-                XCTAssertEqual(effects, [.eventDropped("http_400")])
+                XCTAssertEqual(effects, [.eventDropped("batch_too_large")])
             }
         }
 
@@ -455,7 +455,7 @@ final class RavensightCoreTests: XCTestCase {
         }
         openSession(&core)
 
-        expectBatch(&core, count: 50, respond: 400)
+        expectBatch(&core, count: 50, respond: 413)
         expectBatch(&core, count: 25, respond: 202)
         // A successful send restores the full 50 event limit.
         expectBatch(&core, count: 35, respond: 202)
@@ -666,7 +666,8 @@ final class RavensightCoreTests: XCTestCase {
         openSession(&core)
         let (_, effects) = expectBatch(&core, count: 1, respond: 403, body: jsonBody(["error": "tracking_disabled"]))
         XCTAssertEqual(effects, [.trackingDisabled])
-        XCTAssertTrue(core.pendingEvents.isEmpty)
+        XCTAssertEqual(core.pendingEvents.count, 1, "kept, on disk, for the next launch")
+        XCTAssertEqual(core.nextStep(nowMs: nowMs, ignoringBackoff: true), .idle)
     }
 
     func testServiceUnavailableHonoursRetryAfter() {
@@ -729,7 +730,7 @@ final class RavensightCoreTests: XCTestCase {
     func testTrackTakesAnExplicitTimestamp() {
         var core = makeCore()
         core.track(name: "late", data: nil, nowMs: nowMs, atSec: 123)
-        XCTAssertEqual(core.pendingEvents.first?.timestamp, 123)
+        XCTAssertEqual(core.pendingEvents.first?.timestamp, 123_000)
     }
 
     func testReplaceDeviceIdClearsQueueAndSession() {
@@ -891,34 +892,32 @@ final class RavensightCoreTests: XCTestCase {
         XCTAssertTrue(core.isStale(.exit(retry: true), since: withExit))
     }
 
-    // MARK: Restored queue (0.3.0)
+    // MARK: Restored queue (delivery contract 3)
 
-    func testRestoredEventsGoUnderTheirOwnSessionThenDemoteOn401() {
+    func testRestoredEventsGoUnderTheCurrentSessionWithTheirOwnOrigin() {
         var core = makeCore()
-        let old = (1...3).map { RavensightEvent(name: "old_\($0)", data: [:], timestamp: 1) }
-        core.restore(events: old, sessionToken: "sess_old", expiresAtMs: nowMs + 3_600_000, nowMs: nowMs)
+        let origin: [String: Any] = ["session": "ses_old", "build": "1.0", "platform": "ios", "stamp": "o1.a.b"]
+        let old = (1...3).map { RavensightEvent(name: "old_\($0)", data: [:], timestamp: 1, origin: origin) }
+        core.restore(events: old, nowMs: nowMs)
         XCTAssertEqual(core.pendingCount, 3)
         XCTAssertEqual(core.stats.restored, 3)
         boot(&core)
-
-        guard case .send(let request, .restored(let count)) = core.nextStep(nowMs: nowMs) else {
-            return XCTFail("restored events go first")
+        openSession(&core)
+        guard case .send(let request, .batch(let count)) = core.nextStep(nowMs: nowMs) else {
+            return XCTFail("restored events go out as an ordinary batch")
         }
         XCTAssertEqual(count, 3)
-        XCTAssertEqual(request.headers["X-Session-Token"], "sess_old")
-
-        _ = core.handle(response: RavensightResponse(status: 401), for: .restored(count: 3), nowMs: nowMs)
-        XCTAssertNil(core.restoredBatch)
-        XCTAssertEqual(core.pendingEvents.map { $0.name }, ["old_1", "old_2", "old_3"], "moved to the live queue")
-        openSession(&core)
+        XCTAssertNotEqual(request.headers["X-Session-Token"], "sess_old")
+        let body = try? JSONSerialization.jsonObject(with: request.body ?? Data()) as? [String: Any]
+        let events = body?["events"] as? [[String: Any]] ?? []
+        XCTAssertEqual((events.first?["origin"] as? [String: Any])?["session"] as? String, "ses_old")
     }
 
-    func testRestoredEventsWithAnExpiredSessionJoinTheLiveQueue() {
+    func testRestoredEventsKeepTheCapNewestFirst() {
         var core = makeCore(maxQueueSize: 2)
         core.track(name: "live", data: nil, nowMs: nowMs)
         let old = (1...3).map { RavensightEvent(name: "old_\($0)", data: [:], timestamp: 1) }
-        core.restore(events: old, sessionToken: "sess_old", expiresAtMs: nowMs - 1, nowMs: nowMs)
-        XCTAssertNil(core.restoredBatch)
+        core.restore(events: old, nowMs: nowMs)
         XCTAssertEqual(core.pendingEvents.map { $0.name }, ["old_3", "live"], "the cap keeps the newest")
         XCTAssertEqual(core.stats.dropped, 2)
     }

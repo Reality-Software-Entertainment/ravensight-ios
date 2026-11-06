@@ -228,7 +228,7 @@ final class RavensightErrorClientTests: XCTestCase {
         flush(client)
         let sent = sentData(transport).filter { $0.name == "error" }
         XCTAssertEqual(sent.count, 1)
-        XCTAssertEqual(sent.first?.timestamp, 1_700_000_000)
+        XCTAssertEqual(sent.first?.timestamp, 1_700_000_000_000, "the crash time, in milliseconds")
         let data = sent.first?.data ?? [:]
         XCTAssertEqual(data["rs_source"] as? String, "crash")
         XCTAssertEqual(data["rs_severity"] as? String, "critical")
@@ -376,7 +376,7 @@ final class RavensightErrorClientTests: XCTestCase {
         flush(client)
         let sent = sentData(transport).filter { $0.name == "error" }
         XCTAssertEqual(sent.count, 1)
-        XCTAssertEqual(sent.first?.timestamp, 1_799_990_100)
+        XCTAssertEqual(sent.first?.timestamp, 1_799_990_100_000, "the crash time, in milliseconds")
         XCTAssertEqual(sent.first?.data["rs_error_type"] as? String, "NSRangeException")
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path), "read once, then deleted")
     }

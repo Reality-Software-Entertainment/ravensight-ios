@@ -184,7 +184,8 @@ Ravensight.submitFeedback("The boss fight drags", category: "suggestion", rating
 | `gameVersion` | nil | Nil uses your app bundle's version string. |
 | `flushInterval` | `5` | Seconds between automatic batch sends. `0` sends only at 50 queued, on `flush()`, on background and on quit. |
 | `maxQueueSize` | `500` | Offline queue cap. Oldest events are dropped first. |
-| `persistQueue` | `false` | Keeps the queue in a file under Application Support so it survives a force quit. See "Persisted queue". |
+| `persistQueue` | `true` | Keeps the queue in a file under Application Support so it survives a lost network, a force quit or a crash. See "Persisted queue". |
+| `sendDeviceInfo` | `true` | Sends the device model and OS version on the session. See "Device id and privacy". |
 | `requestTimeout` | `15` | Per request timeout in seconds. |
 | `trackLifecycleEvents` | `true` | Sends `game_started` and `game_exited` automatically. |
 | `performance` | `false` | Opt in to one `health` event per session (frame rate, memory, boot time), sent when the app enters the background. iOS only. See "Typed events". |
@@ -545,43 +546,67 @@ What 0.4.0 adds to every build, public or not:
   failure carries the same ids. A value of your own under that key is
   replaced.
 * **An 8 KB event cap.** An event whose data is larger than 8,192 bytes as
-  JSON is dropped before it is queued, never sent: `track` returns false,
+  JSON (an error event's message, stack and trail counted one byte a
+  character, as the server counts) is dropped before it is queued, never sent: `track` returns false,
   it counts in `stats.droppedEvents`, one console line is printed for the
   run and `onFlush` is called with the error `event_too_large`.
 * **A refused key ends the run** (see `invalid_key` under "Startup
   outcome").
-* **Retry jitter.** A retry wait without a `Retry-After` varies by plus or
-  minus 20 percent; a `Retry-After` is still obeyed exactly.
+* **Retry jitter.** A retry wait without a `Retry-After` is multiplied by a
+  random factor in [0.5, 1); a `Retry-After` is still obeyed exactly.
 
 ## How delivery works
+
+The SDK follows the Ravensight delivery contract, so an event survives a
+lost connection, a crash, a kill and a build update.
 
 * **Batching.** Up to 50 events per request, the server hard limit, on the
   flush timer, at 50 queued, on `flush()`, on background and on quit. A
   flush keeps sending batches until the queue drains.
 * **Offline queue.** Events accumulate up to `maxQueueSize`. Past that the
-  oldest are dropped so the newest are always kept.
-* **Kept on failure.** An event leaves the queue when the server answers
-  `202`, when the queue cap pushes it out, when tracking is turned off, or
-  when the server refuses it on its own (below). By default the queue lives
-  in memory, so events still queued when the process dies are lost; turn on
-  `persistQueue` to keep them (see "Persisted queue").
-* **Session expiry.** A `401` on a batch clears the session, opens a new one
-  and resends the same batch, at most twice in a row before backing off.
+  oldest are dropped so the newest are always kept, except that an
+  automatic error event (`rs_kind: error` with an `rs_source` other than
+  `manual`) is always dropped before any gameplay event, and gameplay
+  events queue ahead of automatic errors.
+* **Original session, build and platform.** Every event carries its own
+  timestamp in milliseconds, set when it was tracked, and the `origin` the
+  session answer gave (an opaque signed stamp of that session, build and
+  platform). An event sent under a later session carries that origin, so
+  the server files it under the run it happened in. The stamp is kept only
+  with the queue, never logged or sent anywhere else.
+* **Kept on failure.** An event leaves the queue on a `2xx` answer, when the
+  queue cap pushes it out, when tracking is turned off, or when the server
+  refuses it (below). The queue is mirrored to disk by default (see
+  "Persisted queue").
+* **Answers.** `400` with an `index` drops that event; `400
+  batch_too_large` and `413` halve the batch, down to one event, which is
+  then dropped; any other `400` drops the request's events. A `401`
+  (including `signature_required`, `signature_invalid` and
+  `signature_expired`) opens a new session once and resends with the same
+  ids; a second `401` in a row waits for the backoff. A `403` on a batch
+  stops sending and keeps the events, on disk, for the next launch. A `415`
+  on a compressed body resends uncompressed.
 * **Answers that no longer apply.** A session or batch answer that arrives
   after `resetDeviceId`, an opt-out or `setEnabled(false)` is ignored, so an
   old identity's session is never adopted and newer events are never
   removed by an older batch's `202`.
 * **Rate limits.** A `429` honors `Retry-After` in seconds, on the settings
-  check as on every other request, and so does a `503`. With no such header the SDK backs off exponentially from 10
-  seconds to a 5 minute ceiling, each wait varied by plus or minus 20
-  percent so many players who failed together do not retry together. The
-  queue is held.
-* **Oversize batches.** A `400` halves the batch and retries down to a single
-  event. An event still rejected on its own is dropped, counted and logged
-  once, so it cannot block everything behind it.
-* **Kill switch.** `GET /settings` is read once at boot, and a `403
-  tracking_disabled` from any endpoint has the same effect: the queue is
-  cleared and nothing is sent for the rest of the run.
+  check as on every other request, and so does a `503`. No flush cuts it
+  short. With no such header the SDK backs off exponentially from 10
+  seconds to a 5 minute ceiling, each wait multiplied by a random factor in
+  [0.5, 1) so many players who failed together do not retry together. An
+  explicit `flush()` cuts a backoff short. The queue is held.
+* **Compression.** A batch body of 1,024 bytes or more is sent gzip
+  compressed (`Content-Encoding: gzip`).
+* **Signed requests.** When the session answer carries `signing` (public
+  `gt_pub_` keys), every batch is signed: `X-Ravensight-Timestamp` and
+  `X-Ravensight-Signature: v1=<HMAC-SHA256>` over the uncompressed body,
+  with the device clock corrected by the server's time. The secret is kept
+  in memory only. Signing proves the request came from code holding that
+  session's secret; it does not prove the build is unmodified.
+* **Kill switch.** `GET /settings` is read once at boot; if it says tracking
+  is off, the queue is cleared and nothing is sent for the run. A `403
+  tracking_disabled` on a batch stops sending and keeps the queue.
 
 The background flush runs under a `UIApplication` background task
 assertion on iOS. The quit flush holds the quit for at most 1.5 seconds on
@@ -623,9 +648,10 @@ Ravensight.shared?.onFlush = { outcome in
 
 ## Persisted queue
 
-With `persistQueue = true` the queue is mirrored to one JSON file under
-Application Support (`Ravensight/queue-<key hash>.json`, excluded from
-backups):
+By default (`persistQueue`, set it to `false` to keep the queue in memory
+only) the queue is mirrored to one JSON file under Application Support
+(`Ravensight/queue-<key hash>.json`, the key hash being 64-bit FNV-1a,
+excluded from backups), in queue format version 2:
 
 * at most 500 events, the newest, whatever `maxQueueSize` says;
 * every write is atomic (a temporary file renamed over the old one);
@@ -634,9 +660,11 @@ backups):
 * the file is read on the SDK's work queue right after the client is
   created, and each write is coalesced over a quarter of a second (a
   background, a quit and anything that empties the queue write at once);
-  events from it go out under
-  the session they were queued in while that session is still valid, and
-  otherwise under the next session, with their original timestamps;
+  events from it go out under the current session, each carrying the
+  origin of the session it was tracked in, with its original timestamp;
+  version 1 files from earlier releases are read as events without an
+  origin;
+* session tokens and signing secrets are never written;
 * it is deleted when the player opts out (also at launch, when a saved
   opt-out is found), on `stopAllTelemetry`, on `resetDeviceId` (before
   `start()` too, where every queue file is removed), on the kill switch,
@@ -799,7 +827,7 @@ found. Leave both unset in a build for real players.
 | Player Reports with a screenshot | Yes, since 0.3.0: `submitReport`. A screenshot is sent only when you pass one; the SDK has no screen capture and no report form UI. |
 | Playtest tagging | Yes: token and run id from the configuration or the launch environment, the `X-Ravensight-Playtest` header, `pt-<runId>` in memory. Not from command line arguments. |
 | Player opt-out | Yes: `setTrackingEnabled`, saved. Plus `stopAllTelemetry` for a stop that also covers synthetic sessions. |
-| Persisted queue | Yes, opt-in: `persistQueue`. Each event keeps its `rs_event_id` through it. |
+| Persisted queue | Yes, on by default: `persistQueue`. Each event keeps its `rs_event_id` and origin through it. |
 | Public builds | Yes, since 0.4.0: `gt_pub_` keys, inert without a key (`optional`), `consent = .optIn`, `distribution`, `rs_event_id`, the 8 KB cap and a refused key ending the run. See "Public builds". |
 | Journeys | Not in this SDK. There is no journey API here; when your Ravensight project has journeys enabled, the server builds them from the level events you track (see "Levels and deaths"). |
 | Design suggestions | Experimental: `fetchSuggestions`. |
@@ -925,8 +953,20 @@ stores it in `UserDefaults` under `ravensight_device_id`. An id saved by an
 earlier version is kept as it is. With `consent = .optIn` it is created at
 the player's first yes, not before, and without a key it is never created. No hardware identifier, advertising id,
 IP based fingerprint or personal data is collected by the SDK itself. Only
-the events you choose to send leave the device. See "Opting out and
-resetting" for the player's controls.
+the events you choose to send leave the device, plus two device fields on
+the session (turn them off with `sendDeviceInfo = false`):
+
+| Field | What | Source |
+| --- | --- | --- |
+| `device.model` | the model identifier, such as `iPhone15,2`, never a serial | `utsname.machine` |
+| `device.osVersion` | the OS version only, such as `17.4.1` | `ProcessInfo.operatingSystemVersion` |
+
+No GPU name is sent. Country is never sent by the SDK. Each value is
+trimmed, kept to printable characters and cut to 128 characters. These are
+device information, not a device identifier, so the privacy manifest needs
+no new category; check this against Apple's categories before release.
+
+See "Opting out and resetting" for the player's controls.
 
 ### Privacy manifest
 
@@ -994,8 +1034,56 @@ arrays, without coercing booleans or strings. Container values are copied.
 
 One persistent cache is scoped to endpoint, key, device, platform and build.
 Offline/malformed responses preserve it. Playtests do not persist config.
-Consent and identity changes discard late results. Active experiments add
-`rs_exp_<key>` labels to newly tracked events, including typed helpers. Already
-queued events keep their original data. A fresh config response uses one ordinary
+Consent and identity changes discard late results.
+
+Exposure: a fetch alone is not an exposure. The first `getConfig` call in a
+run (any key) marks every experiment the last fetch assigned as exposed:
+one `rs_exposure` event is queued then, and every event queued after it
+carries `rs_exp_<key>` = `<variant>`. Events queued before carry no tag, and
+an event stored offline keeps the tag it was queued with. An experiment
+missing from a later fetch is no longer tagged. A well-formed `rs_exp_`
+value your game sets itself is kept; a malformed one is replaced. A run is
+one launch of the client; `resetDeviceId` starts a new one. Do not log or
+display the device id beside config values: anyone holding the build's key
+and a device id can fetch that device's config. A fresh config response uses one ordinary
 event; an unchanged ETag is free. Keep safe defaults for first launch and offline
 play. Config calls and cached values are unavailable while tracking is disabled.
+
+## Ads and attribution
+
+```swift
+// An impression with revenue, in micros of the currency: 0.0015 USD.
+client.trackAdRevenue(network: "admob", format: "rewarded", placement: "level_end",
+                      revenueMicros: "1500", currency: "USD")
+
+// From a mediation callback's values; the mediation SDK is never linked here.
+client.trackAd(.fromAppLovinMax(revenue: ad.revenue, networkName: ad.networkName,
+                                format: ad.format.label, placement: ad.placement))
+client.trackAd(.fromAdMob(valueMicros: value.value.int64Value, currencyCode: value.currencyCode,
+                          adSourceName: sourceName, format: "rewarded", placement: "shop"))
+client.trackAd(.fromIronSource(revenue: revenue, adNetwork: network, adUnit: adUnit, placement: placement))
+client.trackAd(.fromTopOn(publisherRevenue: revenue, currency: currency, networkName: network,
+                          adType: adType, placement: scenario))
+
+// Clicks, rewards and failures carry no revenue.
+client.trackAd(RavensightAd(network: "admob", format: "rewarded", result: "rewarded", placement: "level_end"))
+
+// Where the install came from, once per install.
+client.setAttribution(RavensightAttribution(source: "store_referrer", campaign: "spring"))
+```
+
+* Revenue is a digit string of micros, never a float. A mediation double
+  is formatted to decimal text and converted on its digits, rounding half
+  up (`RavensightAd.microsFromDouble`, `RavensightAd.microsFromDecimalString`).
+* One currency per event, as the mediation SDK reported it. Never converted.
+* Revenue is sent only on `shown`. Revenue without a three letter currency,
+  or on another result, is refused locally and nothing is queued.
+* Mediation format labels map to `banner`, `interstitial`, `rewarded`,
+  `native`, `app_open` or `other` (`RavensightAd.mapFormat`).
+* `setAttribution` sends one `rs_attribution` event per install and saves a
+  flag in `UserDefaults` (`ravensight_attribution_sent`); `resetDeviceId`
+  forgets it. Pass `client.deviceId` to an attribution partner as its
+  customer user id if you use one.
+
+The server must know the `rs_ad_` and `rs_attr_` keys before a public key
+accepts them: use these helpers only with a server release that has them.

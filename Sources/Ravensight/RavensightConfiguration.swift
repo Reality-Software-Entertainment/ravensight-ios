@@ -45,13 +45,20 @@ public struct RavensightConfiguration: Sendable {
     public var maxQueueSize: Int = 500
 
     /// Keep the queue in a small file under Application Support so events
-    /// survive a force quit or a crash. Off by default: the queue then lives
-    /// in memory only. At most 500 events are written (the newest), every
-    /// write is atomic, the file is read when the client is created, and it
-    /// is deleted when the player opts out, on resetDeviceId, on
-    /// stopAllTelemetry and on the kill switch. Never used in a synthetic
-    /// (playtest) session.
-    public var persistQueue: Bool = false
+    /// survive a lost network, a force quit or a crash, and are sent on the
+    /// next launch under the session, build and platform they were tracked
+    /// in (queue format version 2). On by default; false keeps
+    /// the queue in memory only. At most 500 events are written (the
+    /// newest), every write is atomic, events older than 89 days are
+    /// dropped when it is read, and it is deleted when the player opts out,
+    /// on resetDeviceId, on stopAllTelemetry and on the kill switch. Never
+    /// used in a synthetic (playtest) session.
+    public var persistQueue: Bool = true
+
+    /// Send the device model (utsname machine, such as iPhone15,2) and the
+    /// OS version on POST /session. No permission prompt and no hardware
+    /// identifier. On by default.
+    public var sendDeviceInfo: Bool = true
 
     /// Seconds between automatic flushes. 0 flushes only on demand (and
     /// whenever 50 events are queued, on background and on quit).

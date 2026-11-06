@@ -16,6 +16,8 @@ final class FakeTransport: RavensightTransport {
     var sessionError: String?
     var batchStatus = 202
     var batchError: String?
+    /// Sent as the session answer's signing object when set.
+    var signing: [String: Any]?
     /// Requests whose completion is never called (a hung network).
     var hang = false
     /// Answers a request before the scripted routes, when it returns one.
@@ -51,6 +53,15 @@ final class FakeTransport: RavensightTransport {
     }
 
     /// Every event sent in a batch, with the session token it went under.
+    /// Every batch event as sent, with its data and any origin.
+    func sentPayloads() -> [[String: Any]] {
+        return requests(suffix: "/track/batch").flatMap { request -> [[String: Any]] in
+            guard let body = request.body,
+                  let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else { return [] }
+            return object["events"] as? [[String: Any]] ?? []
+        }
+    }
+
     func sentEvents() -> [(name: String, timestamp: Int64, token: String)] {
         return requests(suffix: "/track/batch").flatMap { request -> [(name: String, timestamp: Int64, token: String)] in
             guard let body = request.body,
@@ -66,9 +77,25 @@ final class FakeTransport: RavensightTransport {
         }
     }
 
-    func send(_ request: RavensightRequest, completion: @escaping (RavensightResponse) -> Void) {
+    /// What the server reads: a gzip body decoded, the header kept so a
+    /// test can still see it was compressed.
+    static func decoded(_ request: RavensightRequest) -> RavensightRequest {
+        var copy = request
+        if request.headers["Content-Encoding"] == "gzip", let body = request.body,
+           let plain = RavensightWire.gunzip(body) {
+            copy.body = plain
+        }
+        return copy
+    }
+
+    /// The requests exactly as they went on the wire, gzip bodies included.
+    private(set) var wire: [RavensightRequest] = []
+
+    func send(_ raw: RavensightRequest, completion: @escaping (RavensightResponse) -> Void) {
+        let request = FakeTransport.decoded(raw)
         lock.lock()
         recorded.append(request)
+        wire.append(raw)
         let hung = hang
         if let suffix = holdSuffix, request.url.hasSuffix(suffix) {
             held.append(completion)
@@ -98,7 +125,14 @@ final class FakeTransport: RavensightTransport {
                 sessionCount += 1
                 let token = "\(sessionPrefix)_\(sessionCount)"
                 lock.unlock()
-                completion(RavensightResponse(status: 201, body: json(["token": token, "expiresIn": 86_400])))
+                var answer: [String: Any] = [
+                    "token": token, "expiresIn": 86_400,
+                    "origin": ["session": "ses_" + token, "build": "9.9.9", "platform": "ios", "stamp": "o1.a.b"],
+                ]
+                lock.lock()
+                if let signing = signing { answer["signing"] = signing }
+                lock.unlock()
+                completion(RavensightResponse(status: 201, body: json(answer)))
             } else {
                 completion(RavensightResponse(status: sessionStatus, body: json(["error": sessionError ?? "refused"])))
             }
@@ -168,6 +202,7 @@ final class RavensightClientTests: XCTestCase {
         configuration.gameVersion = "9.9.9"
         configuration.trackLifecycleEvents = lifecycleEvents
         configuration.flushInterval = 0 // tests flush explicitly
+        configuration.persistQueue = false // no temp directory here; the store has its own tests
         configure(&configuration)
         let clock = self.clock
         return RavensightClient(
@@ -547,7 +582,7 @@ final class RavensightClientTests: XCTestCase {
         client.setTrackingEnabled(true)
         flushAndWait(client)
         XCTAssertEqual(transport.sentEvents().map { $0.name }, ["game_started", "after"])
-        XCTAssertEqual(transport.sentEvents().first?.timestamp, clock.nowMs / 1000)
+        XCTAssertEqual(transport.sentEvents().first?.timestamp, clock.nowMs)
     }
 
     func testShortBackgroundSendsNothingAndKeepsTheSession() {
@@ -589,7 +624,7 @@ final class RavensightClientTests: XCTestCase {
         XCTAssertEqual(events[1].token, "sess_1", "game_exited goes under the old session")
         XCTAssertEqual(events[1].timestamp, leftAt, "stamped when the player left")
         XCTAssertEqual(events[2].token, "sess_2", "a new session opens")
-        XCTAssertEqual(events[2].timestamp, clock.nowMs / 1000)
+        XCTAssertEqual(events[2].timestamp, clock.nowMs)
         XCTAssertEqual(client.sessionToken, "sess_2")
     }
 

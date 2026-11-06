@@ -141,6 +141,7 @@ final class RavensightTypedEventsTests: XCTestCase {
         configuration.flushInterval = 0
         configuration.performance = performance
         configuration.enabled = enabled
+        configuration.persistQueue = false
         return Ravensight.start(configuration, makeClient: {
             let client = RavensightClient(
                 configuration: $0, transport: transport, now: { self.nowMs },

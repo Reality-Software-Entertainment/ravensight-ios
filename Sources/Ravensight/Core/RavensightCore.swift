@@ -4,11 +4,23 @@ import Foundation
 struct RavensightEvent {
     var name: String
     var data: [String: Any]
-    /// Unix seconds, captured when the event happened.
+    /// Unix milliseconds, captured when the event happened.
     var timestamp: Int64
+    /// The /session answer's origin of the session this event was tracked
+    /// under, exactly as received. Nil when that session had none or none
+    /// was open yet.
+    var origin: [String: Any]? = nil
+    /// Loaded from the queue file: never given the current session's origin.
+    var restored = false
 
-    func payload() -> [String: Any] {
-        return ["event": name, "data": data, "timestamp": timestamp]
+    /// The event as sent. An event tracked under an earlier session than
+    /// currentSession carries that session's origin, copied verbatim.
+    func payload(currentSession: String? = nil) -> [String: Any] {
+        var out: [String: Any] = ["event": name, "data": data, "timestamp": timestamp]
+        if let origin = origin, let session = origin["session"] as? String, session != currentSession {
+            out["origin"] = origin
+        }
+        return out
     }
 }
 
@@ -30,6 +42,8 @@ struct RavensightCoreConfig {
     /// Mints every event's rs_event_id. Shared with the client, which stamps
     /// ids on the caller's thread.
     var eventIds: RavensightEventIds
+    /// Optional device fields sent on POST /session (model, osVersion, gpu).
+    var device: [String: String] = [:]
 
     init(
         ingestKey: String,
@@ -99,10 +113,11 @@ struct RavensightCore {
     static let sessionExpirySkewMs: Int64 = 5_000
     /// A batch 401 re opens the session at most this many times in a row
     /// before falling back to the exponential backoff.
-    static let maxSessionReopens = 2
-    /// Retry waits without a Retry-After vary by this fraction either way,
-    /// so many clients that failed together do not retry together.
-    static let backoffJitter = 0.2
+    static let maxSessionReopens = 1
+    /// Retry waits without a Retry-After are multiplied by a factor in
+    /// [backoffJitterFloor, 1), so many clients that failed together do not
+    /// retry together.
+    static let backoffJitterFloor = 0.5
     static let minRetryMs: Int64 = 500
     /// An event whose data is larger than this as JSON is dropped before it
     /// is queued, never sent.
@@ -134,9 +149,6 @@ struct RavensightCore {
         /// under that session's own token. retry is false for the cold
         /// launch marker (one attempt, whatever the answer).
         case exit(retry: Bool)
-        /// Events restored from the persisted queue, sent under the session
-        /// they were queued in while that session is still valid.
-        case restored(count: Int)
     }
 
     /// What the driver should do next.
@@ -162,15 +174,6 @@ struct RavensightCore {
         case keyRefused
         /// Permanent stop for the run (a closed or invalid playtest token).
         case stopped(String)
-    }
-
-    /// Events restored from disk that belong to an earlier, unexpired
-    /// session, sent under that session's token before the live queue.
-    struct RestoredBatch {
-        var sessionToken: String
-        /// Unix milliseconds.
-        var expiresAtMs: Int64
-        var events: [RavensightEvent]
     }
 
     /// A game_exited waiting to go out under a session that has ended.
@@ -217,8 +220,31 @@ struct RavensightCore {
     /// errors held before it can be sent or discarded.
     private(set) var errorCaptureAnswered = false
 
-    var configExperiments: [String: String] = [:]
+    /// The experiments the last config fetch assigned. Replacing them stops
+    /// tagging any exposed experiment no longer listed.
+    var configExperiments: [String: String] = [:] {
+        didSet {
+            var kept: [String: String] = [:]
+            for key in exposed.keys { if let variant = configExperiments[key] { kept[key] = variant } }
+            exposed = kept
+        }
+    }
     var configExperimentDevice: String = ""
+    /// Experiments exposed this run (a typed config read happened while they
+    /// were assigned). Every event queued after carries their tags.
+    private(set) var exposed: [String: String] = [:]
+    /// The current session's origin, exactly as the /session answer gave it.
+    private(set) var sessionOrigin: [String: Any]?
+    /// The current session's signing secret, memory only, and the device
+    /// clock's offset from the server's (ms).
+    private(set) var signingSecret: String?
+    private(set) var clockOffsetMs: Int64 = 0
+    /// A Retry-After wait no flush may cut short.
+    private(set) var retryAfterUntilMs: Int64 = 0
+    /// Set after a 415 on a compressed body: plain bodies for the run.
+    private(set) var gzipRefused = false
+    /// Queued events carried by the batch request in flight (noteInFlight).
+    private(set) var inFlightCount = 0
     private(set) var sessionToken: String?
     /// Unix milliseconds.
     private(set) var sessionExpiresAtMs: Int64 = 0
@@ -226,9 +252,6 @@ struct RavensightCore {
     private(set) var sessionWanted = false
 
     private(set) var pendingEvents: [RavensightEvent] = [] {
-        didSet { queueRevision &+= 1 }
-    }
-    private(set) var restoredBatch: RestoredBatch? {
         didSet { queueRevision &+= 1 }
     }
     private(set) var pendingExit: PendingExit?
@@ -270,7 +293,7 @@ struct RavensightCore {
             return false
         case .session:
             return sent.session != sessionGeneration
-        case .batch, .restored:
+        case .batch:
             return sent.queue != queueGeneration
         case .exit:
             return sent.exit != pendingExit
@@ -315,9 +338,9 @@ struct RavensightCore {
         return copy
     }
 
-    /// Events waiting to be sent: the live queue plus any restored batch.
+    /// Events waiting to be sent.
     var pendingCount: Int {
-        return pendingEvents.count + (restoredBatch?.events.count ?? 0)
+        return pendingEvents.count
     }
 
     func isSessionValid(nowMs: Int64) -> Bool {
@@ -363,19 +386,30 @@ struct RavensightCore {
         } else {
             payload = RavensightCore.sanitizeJSON(data ?? [:]) as? [String: Any] ?? [:]
             payload[RavensightCore.eventIdKey] = config.eventIds.next()
-            if RavensightCore.eventBytes(payload) > RavensightCore.maxEventBytes {
+            if RavensightWire.countedBytes(payload) > RavensightCore.maxEventBytes {
                 counters.dropped += 1
                 return false
             }
         }
 
-        if configExperimentDevice == config.deviceId {
-            for (key, variant) in configExperiments { payload["rs_exp_" + key] = variant }
+        // A well-formed rs_exp_ tag from the game is the game's to keep; a
+        // malformed one is removed, and the SDK's own used if it has one.
+        for key in payload.keys where key.hasPrefix("rs_exp_") {
+            if !RavensightCore.validExperimentKey(String(key.dropFirst(7))) ||
+                !RavensightCore.validVariant(payload[key] as? String) {
+                payload.removeValue(forKey: key)
+            }
         }
-        if RavensightCore.eventBytes(payload) > RavensightCore.maxEventBytes {
+        if configExperimentDevice == config.deviceId {
+            for (key, variant) in exposed where payload["rs_exp_" + key] == nil {
+                payload["rs_exp_" + key] = variant
+            }
+        }
+        if RavensightWire.countedBytes(payload) > RavensightCore.maxEventBytes {
             counters.dropped += 1
             return false
         }
+        let automatic = RavensightCore.isAutomaticError(payload)
         // Gameplay events keep their place ahead of automatic errors: a full
         // queue drops the incoming error, or the oldest queued error, before
         // any gameplay event.
@@ -391,11 +425,19 @@ struct RavensightCore {
             }
             counters.dropped += 1
         }
-        pendingEvents.append(RavensightEvent(
+        let event = RavensightEvent(
             name: name,
             data: payload,
-            timestamp: atSec ?? nowMs / 1000
-        ))
+            timestamp: atSec.map { $0 * 1000 } ?? nowMs,
+            origin: isSessionValid(nowMs: nowMs) ? sessionOrigin : nil
+        )
+        if !automatic, let at = pendingEvents.firstIndex(where: { RavensightCore.isAutomaticError($0.data) }) {
+            // Ahead of the queued errors, but never inside a batch in flight,
+            // whose answer removes it by position.
+            pendingEvents.insert(event, at: max(at, min(inFlightCount, pendingEvents.count)))
+        } else {
+            pendingEvents.append(event)
+        }
         counters.accepted += 1
         return true
     }
@@ -417,16 +459,42 @@ struct RavensightCore {
         errorCaptureAnswered = true
     }
 
-    /// Puts events loaded from the persisted queue back. Events that were
-    /// queued under a session that is still valid go out under that session
-    /// first; the rest join the front of the live queue and are sent under
-    /// the next session. The cap still applies, oldest dropped first.
-    mutating func restore(
-        events: [RavensightEvent],
-        sessionToken: String?,
-        expiresAtMs: Int64,
-        nowMs: Int64
-    ) {
+    /// The driver tells the core how many queued events a batch request in
+    /// flight carries, so nothing is inserted inside it. Cleared by the answer.
+    mutating func noteInFlight(_ count: Int) {
+        inFlightCount = count
+    }
+
+    /// A typed config read: every assigned experiment not yet exposed this
+    /// run becomes exposed, and one rs_exposure event carrying their tags is
+    /// queued. Returns true when it queued one.
+    @discardableResult
+    mutating func expose(nowMs: Int64) -> Bool {
+        guard canQueue, configExperimentDevice == config.deviceId else { return false }
+        let fresh = configExperiments.filter { exposed[$0.key] == nil }
+        guard !fresh.isEmpty else { return false }
+        for (key, variant) in fresh { exposed[key] = variant }
+        return track(name: "rs_exposure", data: [:], nowMs: nowMs)
+    }
+
+    /// Forgets this run's exposures (a device id reset starts a new run).
+    mutating func clearExposures() {
+        exposed = [:]
+    }
+
+    static func validExperimentKey(_ key: String) -> Bool {
+        return key.range(of: "^[a-z][a-z0-9_]{0,63}$", options: .regularExpression) != nil
+    }
+
+    static func validVariant(_ variant: String?) -> Bool {
+        guard let variant = variant else { return false }
+        return variant.range(of: "^[a-z][a-z0-9_-]{0,39}$", options: .regularExpression) != nil
+    }
+
+    /// Puts events loaded from the persisted queue back, at the front of the
+    /// queue. They are sent under the current session, each carrying the
+    /// origin it was saved with. The cap still applies, oldest dropped first.
+    mutating func restore(events: [RavensightEvent], nowMs: Int64) {
         guard canQueue, !events.isEmpty else { return }
         // Events saved by 0.3 have no rs_event_id; they get one now, and
         // keep it from here on. Saved ids are never replaced.
@@ -441,19 +509,11 @@ struct RavensightCore {
             kept = Array(kept.suffix(config.maxQueueSize))
         }
         counters.restored += kept.count
-        if let token = sessionToken, !token.isEmpty,
-           nowMs < expiresAtMs - RavensightCore.sessionExpirySkewMs {
-            if let existing = restoredBatch, existing.sessionToken == token {
-                restoredBatch?.events = existing.events + kept
-            } else {
-                restoredBatch = RestoredBatch(sessionToken: token, expiresAtMs: expiresAtMs, events: kept)
-            }
-        } else {
-            pendingEvents.insert(contentsOf: kept, at: 0)
-            while pendingEvents.count > config.maxQueueSize {
-                pendingEvents.removeFirst()
-                counters.dropped += 1
-            }
+        for index in kept.indices { kept[index].restored = true }
+        pendingEvents.insert(contentsOf: kept, at: 0)
+        while pendingEvents.count > config.maxQueueSize {
+            pendingEvents.removeFirst()
+            counters.dropped += 1
         }
     }
 
@@ -461,18 +521,6 @@ struct RavensightCore {
     /// file's age limit or cap).
     mutating func countDropped(_ count: Int) {
         counters.dropped += max(0, count)
-    }
-
-    /// Moves a restored batch into the front of the live queue (its session
-    /// is gone), keeping the cap.
-    private mutating func demoteRestoredBatch() {
-        guard let batch = restoredBatch else { return }
-        restoredBatch = nil
-        pendingEvents.insert(contentsOf: batch.events, at: 0)
-        while pendingEvents.count > config.maxQueueSize {
-            pendingEvents.removeFirst()
-            counters.dropped += 1
-        }
     }
 
     /// The game's runtime switch. Disabling discards anything queued so an
@@ -504,6 +552,7 @@ struct RavensightCore {
         config.eventIds.setDeviceId(deviceId)
         discardQueue()
         invalidateSession()
+        exposed = [:]
     }
 
     /// Ask the state machine to open a session even with an empty queue
@@ -517,6 +566,8 @@ struct RavensightCore {
         sessionGeneration += 1
         sessionToken = nil
         sessionExpiresAtMs = 0
+        sessionOrigin = nil
+        signingSecret = nil
     }
 
     /// Queue the game_exited of a session that has ended, to be sent under
@@ -532,7 +583,7 @@ struct RavensightCore {
         queueGeneration += 1
         counters.dropped += pendingCount
         pendingEvents.removeAll()
-        restoredBatch = nil
+        inFlightCount = 0
         sessionWanted = false
         pendingExit = nil
     }
@@ -545,6 +596,11 @@ struct RavensightCore {
     /// once and makes one more attempt after a refused key.
     func nextStep(nowMs: Int64, ignoringBackoff: Bool = false) -> Step {
         guard enabled, !optedOut, stopReason == nil else { return .idle }
+
+        // A server's Retry-After is never cut short, by a flush or anything.
+        if nowMs < retryAfterUntilMs && (pendingExit != nil || !pendingEvents.isEmpty || !settingsChecked || sessionWanted) {
+            return .wait(untilMs: retryAfterUntilMs)
+        }
 
         if let exit = pendingExit, trackingEnabled {
             if !ignoringBackoff && nowMs < nextAttemptAtMs {
@@ -563,15 +619,6 @@ struct RavensightCore {
         }
         guard trackingEnabled else { return .idle }
 
-        if let batch = restoredBatch {
-            if !ignoringBackoff && nowMs < nextAttemptAtMs {
-                return .wait(untilMs: nextAttemptAtMs)
-            }
-            let count = min(batchLimit, batch.events.count)
-            let events = batch.events.prefix(count).map { $0.payload() }
-            return .send(eventsRequest(events: events, token: batch.sessionToken), .restored(count: count))
-        }
-
         let hasWork = !pendingEvents.isEmpty || sessionWanted
         guard hasWork else { return .idle }
 
@@ -585,7 +632,7 @@ struct RavensightCore {
 
         guard !pendingEvents.isEmpty else { return .idle }
         let count = min(batchLimit, pendingEvents.count)
-        return .send(batchRequest(count: count), .batch(count: count))
+        return .send(batchRequest(count: count, nowMs: nowMs), .batch(count: count))
     }
 
     /// Feed the response for a request previously handed out by nextStep.
@@ -596,11 +643,10 @@ struct RavensightCore {
         case .session:
             return handleSession(response, nowMs: nowMs)
         case .batch(let count):
+            inFlightCount = 0
             return handleBatch(response, count: count, nowMs: nowMs)
         case .exit(let retry):
             return handleExit(response, retry: retry, nowMs: nowMs)
-        case .restored(let count):
-            return handleRestored(response, count: count, nowMs: nowMs)
         }
     }
 
@@ -661,6 +707,26 @@ struct RavensightCore {
             sessionToken = token
             sessionExpiresAtMs = RavensightCore.resolveExpiryMs(parsed, nowMs: nowMs)
             readErrorCapture(parsed)
+            // The origin, kept exactly as received: events tracked under this
+            // session carry it, so a later launch sends them as this session's.
+            sessionOrigin = parsed?["origin"] as? [String: Any]
+            if let origin = sessionOrigin {
+                for index in pendingEvents.indices
+                where !pendingEvents[index].restored && pendingEvents[index].origin == nil {
+                    pendingEvents[index].origin = origin
+                }
+            }
+            // A public key's signing secret: memory only, never saved.
+            signingSecret = nil
+            clockOffsetMs = 0
+            if let signing = parsed?["signing"] as? [String: Any],
+               signing["algorithm"] as? String == "HMAC-SHA256",
+               let secret = signing["secret"] as? String, !secret.isEmpty {
+                signingSecret = secret
+                if let serverTime = RavensightCore.numberValue(signing["serverTime"]), serverTime > 0 {
+                    clockOffsetMs = Int64(serverTime * 1000) - nowMs
+                }
+            }
             sessionWanted = false
             keyRefused = false
             lastFailure = nil
@@ -695,7 +761,7 @@ struct RavensightCore {
 
     private mutating func handleBatch(_ response: RavensightResponse, count: Int, nowMs: Int64) -> [Effect] {
         switch response.status {
-        case 202:
+        case 200..<300:
             let removed = min(count, pendingEvents.count)
             pendingEvents.removeFirst(removed)
             counters.sent += removed
@@ -707,9 +773,9 @@ struct RavensightCore {
             return [.eventsFlushed(removed)]
 
         case 401:
-            // Session expired or revoked. The batch stays queued and is re
-            // sent as soon as a fresh session is issued. After two re opens
-            // in a row the backoff takes over instead of spinning.
+            // Session expired or revoked, or a signature refused. The batch
+            // stays queued and is re sent, with the same ids, under a fresh
+            // session opened once; a second 401 in a row waits for the backoff.
             invalidateSession()
             consecutiveUnauthorized += 1
             if consecutiveUnauthorized > RavensightCore.maxSessionReopens {
@@ -718,68 +784,41 @@ struct RavensightCore {
             return []
 
         case 403:
-            return handleForbidden(response)
+            // Stop sending for the run; the events stay queued (and on disk)
+            // for the next launch.
+            return handleForbidden(response, keepQueue: true)
 
         case 429, 503:
             applyRetryAfter(response, nowMs: nowMs)
             if response.status == 429 { lastFailure = Reason.rateLimited }
             return [.flushFailed(response.errorCode(fallback: response.status == 429 ? "rate_limited" : "http_503"))]
 
-        case 400, 413:
-            // A 413 is the same problem as a 400: split, then drop the one
-            // bad event. Never retried as is.
-            if count > 1 {
-                // Oversize batch: halve and retry, down to a single event.
+        case 415 where !gzipRefused:
+            // The server or a proxy refused the compressed body: plain from now.
+            gzipRefused = true
+            return []
+
+        case 400, 413, 415:
+            let code = response.errorCode(fallback: "http_\(response.status)")
+            let parsed = response.json as? [String: Any]
+            if response.status == 400, let index = (parsed?["index"] as? NSNumber)?.intValue,
+               index >= 0, index < min(count, pendingEvents.count) {
+                pendingEvents.remove(at: index)
+                counters.dropped += 1
+                batchLimit = RavensightCore.maxBatchSize
+                return [.eventDropped(code)]
+            }
+            let tooLarge = response.status == 413 || code == "batch_too_large"
+            if tooLarge && count > 1 {
                 batchLimit = max(1, count / 2)
                 return []
             }
-            // A single event the server will never take. Drop it so the rest
-            // of the queue is not blocked behind it forever.
-            if !pendingEvents.isEmpty {
-                pendingEvents.removeFirst()
-                counters.dropped += 1
-            }
+            let removed = min(count, pendingEvents.count)
+            pendingEvents.removeFirst(removed)
+            counters.dropped += removed
             batchLimit = RavensightCore.maxBatchSize
-            return [.eventDropped(response.errorCode(fallback: "http_\(response.status)"))]
+            return [.eventDropped(code)]
 
-        default:
-            scheduleBackoff(nowMs: nowMs)
-            if response.status == 0 { lastFailure = Reason.offline }
-            return [.flushFailed(response.errorCode(fallback: fallbackCode(for: response.status)))]
-        }
-    }
-
-    private mutating func handleRestored(_ response: RavensightResponse, count: Int, nowMs: Int64) -> [Effect] {
-        guard var batch = restoredBatch else { return [] }
-        switch response.status {
-        case 202:
-            let removed = min(count, batch.events.count)
-            batch.events.removeFirst(removed)
-            restoredBatch = batch.events.isEmpty ? nil : batch
-            counters.sent += removed
-            counters.flushes += 1
-            batchLimit = RavensightCore.maxBatchSize
-            lastFailure = nil
-            resetBackoff()
-            return [.eventsFlushed(removed)]
-        case 401, 400, 413:
-            // The old session is gone (401), or the batch needs splitting
-            // (400, 413): either way the live queue's own handling takes over,
-            // under the current session.
-            demoteRestoredBatch()
-            return []
-        case 403:
-            let code = response.errorCode(fallback: "")
-            if code == "tracking_disabled" || code == "playtest_job_closed" || code == "invalid_playtest_token" {
-                return handleForbidden(response)
-            }
-            // Any other 403 here is about the old session, not the key.
-            demoteRestoredBatch()
-            return []
-        case 429, 503:
-            applyRetryAfter(response, nowMs: nowMs)
-            if response.status == 429 { lastFailure = Reason.rateLimited }
-            return [.flushFailed(response.errorCode(fallback: response.status == 429 ? "rate_limited" : "http_503"))]
         default:
             scheduleBackoff(nowMs: nowMs)
             if response.status == 0 { lastFailure = Reason.offline }
@@ -817,10 +856,10 @@ struct RavensightCore {
     /// Routes a 403 by its error code: the kill switch, a closed or invalid
     /// playtest token, or otherwise a refused key. endsRun is set for the
     /// settings check and the session open, where a refused key ends the run.
-    private mutating func handleForbidden(_ response: RavensightResponse, endsRun: Bool = false) -> [Effect] {
+    private mutating func handleForbidden(_ response: RavensightResponse, endsRun: Bool = false, keepQueue: Bool = false) -> [Effect] {
         switch response.errorCode(fallback: "") {
         case "tracking_disabled":
-            return killSwitch()
+            return killSwitch(keepQueue: keepQueue)
         case "playtest_job_closed":
             stop(reason: Reason.playtestJobClosed)
             return [.stopped(Reason.playtestJobClosed)]
@@ -832,9 +871,9 @@ struct RavensightCore {
         }
     }
 
-    private mutating func killSwitch() -> [Effect] {
+    private mutating func killSwitch(keepQueue: Bool = false) -> [Effect] {
         trackingEnabled = false
-        discardQueue()
+        if !keepQueue { discardQueue() }
         return [.trackingDisabled]
     }
 
@@ -858,14 +897,15 @@ struct RavensightCore {
     private mutating func resetBackoff() {
         backoffMs = RavensightCore.defaultRetryMs
         nextAttemptAtMs = 0
+        retryAfterUntilMs = 0
     }
 
-    /// The current backoff with plus or minus 20 percent jitter, never more
-    /// than the 5 minute ceiling and never less than half a second. A
-    /// Retry-After is obeyed exactly instead (applyRetryAfter).
+    /// The current backoff times a factor in [0.5, 1), never more than the 5
+    /// minute ceiling and never less than half a second. A Retry-After is
+    /// obeyed exactly instead (applyRetryAfter).
     private mutating func scheduleBackoff(nowMs: Int64) {
         let roll = min(max(random(), 0), 1)
-        let factor = 1 - RavensightCore.backoffJitter + 2 * RavensightCore.backoffJitter * roll
+        let factor = RavensightCore.backoffJitterFloor + (1 - RavensightCore.backoffJitterFloor) * roll
         let jittered = min(Int64((Double(backoffMs) * factor).rounded()), RavensightCore.maxBackoffMs)
         nextAttemptAtMs = nowMs + max(jittered, RavensightCore.minRetryMs)
         backoffMs = min(backoffMs * 2, RavensightCore.maxBackoffMs)
@@ -875,6 +915,7 @@ struct RavensightCore {
         let waitMs = response.retryAfterMs
         if waitMs > 0 {
             nextAttemptAtMs = nowMs + waitMs
+            retryAfterUntilMs = nextAttemptAtMs
         } else {
             scheduleBackoff(nowMs: nowMs)
         }
@@ -910,6 +951,7 @@ struct RavensightCore {
             "sdk": "ios/" + RavensightClient.sdkVersion,
         ]
         if let distribution = config.distribution { body["distribution"] = distribution }
+        if !config.device.isEmpty { body["device"] = config.device }
         return RavensightRequest(
             method: "POST",
             url: config.apiUrl + "/session",
@@ -921,9 +963,10 @@ struct RavensightCore {
         )
     }
 
-    private func batchRequest(count: Int) -> RavensightRequest {
-        let events = pendingEvents.prefix(count).map { $0.payload() }
-        return eventsRequest(events: events, token: sessionToken ?? "")
+    private func batchRequest(count: Int, nowMs: Int64) -> RavensightRequest {
+        let current = sessionOrigin?["session"] as? String
+        let events = pendingEvents.prefix(count).map { $0.payload(currentSession: current) }
+        return eventsRequest(events: events, token: sessionToken ?? "", nowMs: nowMs, secret: signingSecret)
     }
 
     private func exitRequest(_ exit: PendingExit) -> RavensightRequest {
@@ -932,16 +975,30 @@ struct RavensightCore {
         return eventsRequest(events: [event.payload()], token: exit.sessionToken)
     }
 
-    private func eventsRequest(events: [[String: Any]], token: String) -> RavensightRequest {
-        let body: [String: Any] = ["events": events]
+    /// A /track/batch request: signed over the exact body when the session
+    /// has a secret, and gzipped from 1,024 bytes unless the server refused
+    /// a compressed body this run.
+    private func eventsRequest(events: [[String: Any]], token: String, nowMs: Int64 = 0, secret: String? = nil) -> RavensightRequest {
+        let body = RavensightCore.encodeJSON(["events": events])
+        var headers = [
+            "Content-Type": "application/json",
+            "X-Session-Token": token,
+        ]
+        if let secret = secret {
+            let timestamp = (nowMs + clockOffsetMs) / 1000
+            headers["X-Ravensight-Timestamp"] = String(timestamp)
+            headers["X-Ravensight-Signature"] = RavensightWire.signatureHeader(secret: secret, timestamp: timestamp, body: body)
+        }
+        var sent = body
+        if !gzipRefused, body.count >= RavensightWire.gzipThreshold, let packed = RavensightWire.gzip(body) {
+            sent = packed
+            headers["Content-Encoding"] = "gzip"
+        }
         return RavensightRequest(
             method: "POST",
             url: config.apiUrl + "/track/batch",
-            headers: withPlaytest([
-                "Content-Type": "application/json",
-                "X-Session-Token": token,
-            ]),
-            body: RavensightCore.encodeJSON(body)
+            headers: withPlaytest(headers),
+            body: sent
         )
     }
 

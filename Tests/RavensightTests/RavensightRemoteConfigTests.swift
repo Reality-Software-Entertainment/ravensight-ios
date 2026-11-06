@@ -11,6 +11,7 @@ final class RavensightRemoteConfigTests: XCTestCase {
         config.apiUrl = "https://fake.test"
         config.trackLifecycleEvents = false
         config.flushInterval = 0
+        config.persistQueue = false
         return RavensightClient(configuration: config, transport: transport, now: nil, defaults: defaults, environment: [:], isBackgroundLaunch: { false }, installsLifecycleObservers: false)
     }
     func fetched(_ client: RavensightClient) -> RavensightConfigResult {
@@ -60,7 +61,12 @@ final class RavensightRemoteConfigTests: XCTestCase {
         XCTAssertEqual(request.headers["X-API-Key"], "public")
         sdk.workQueue.sync {
             XCTAssertEqual(sdk.core.configExperiments, ["difficulty": "easy"])
+            // The typed read above exposed the experiment: one rs_exposure.
+            XCTAssertEqual(sdk.core.pendingEvents.filter { $0.name == "rs_exposure" }.count, 1)
+            // A well-formed game value is kept; a malformed one is replaced.
             sdk.core.track(name: "level", data: ["rs_exp_difficulty": "forged"], nowMs: 0)
+            XCTAssertEqual(sdk.core.pendingEvents.last?.data["rs_exp_difficulty"] as? String, "forged")
+            sdk.core.track(name: "level", data: ["rs_exp_difficulty": "Bad Value"], nowMs: 0)
             XCTAssertEqual(sdk.core.pendingEvents.last?.data["rs_exp_difficulty"] as? String, "easy")
         }
         let offline = FakeTransport()

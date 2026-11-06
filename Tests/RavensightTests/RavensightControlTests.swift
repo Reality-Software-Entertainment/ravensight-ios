@@ -198,6 +198,7 @@ final class RavensightControlTests: XCTestCase {
         let transport = FakeTransport()
         var configuration = RavensightConfiguration(ingestKey: "gt_live_test")
         configuration.trackLifecycleEvents = false
+        configuration.persistQueue = false
         let client = Ravensight.start(configuration) { configuration in
             RavensightClient(
                 configuration: configuration, transport: transport, now: nil,
@@ -291,10 +292,15 @@ final class RavensightControlTests: XCTestCase {
 
     // MARK: Persisted queue
 
-    func testPersistQueueIsOffByDefault() {
+    func testPersistQueueIsOnByDefaultAndCanBeTurnedOff() {
         let client = makeClient(transport: FakeTransport())
         client.track("a")
         settle(client)
+        XCTAssertFalse(queueFiles.isEmpty)
+        try? FileManager.default.removeItem(at: queueDirectory)
+        let off = makeClient(transport: FakeTransport()) { $0.persistQueue = false }
+        off.track("a")
+        settle(off)
         XCTAssertTrue(queueFiles.isEmpty)
     }
 
@@ -318,7 +324,7 @@ final class RavensightControlTests: XCTestCase {
         XCTAssertTrue(queueFiles.filter { $0.pathExtension == "json" }.isEmpty, "an empty queue deletes the file")
     }
 
-    func testRestoredEventsGoOutUnderTheSessionTheyWereQueuedIn() {
+    func testRestoredEventsGoOutWithTheOriginTheyWereQueuedUnder() {
         let firstTransport = FakeTransport()
         firstTransport.sessionPrefix = "old"
         firstTransport.batchStatus = 503 // held, so they are still queued at the force quit
@@ -334,9 +340,17 @@ final class RavensightControlTests: XCTestCase {
         second.start()
         second.track("fresh")
         flushAndWait(second)
+        // Sent under the current session, carrying the origin of the one it
+        // was tracked in, so the server files it under that run.
         let sent = transport.sentEvents()
-        XCTAssertEqual(sent.first { $0.name == "last_words" }?.token, "old_1")
+        XCTAssertEqual(sent.first { $0.name == "last_words" }?.token, "new_1")
         XCTAssertEqual(sent.first { $0.name == "fresh" }?.token, "new_1")
+        let payloads = transport.sentPayloads()
+        let old = payloads.first { $0["event"] as? String == "last_words" }
+        XCTAssertEqual((old?["origin"] as? [String: Any])?["session"] as? String, "ses_old_1")
+        XCTAssertEqual((old?["origin"] as? [String: Any])?["stamp"] as? String, "o1.a.b")
+        let fresh = payloads.first { $0["event"] as? String == "fresh" }
+        XCTAssertNil(fresh?["origin"], "the current session needs no origin")
     }
 
     func testRestoredEventsWhoseSessionExpiredJoinTheNewSession() {
