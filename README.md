@@ -68,7 +68,7 @@ Or add it to your `Package.swift` yourself:
 dependencies: [
     .package(
         url: "https://github.com/Reality-Software-Entertainment/ravensight-ios.git",
-        from: "0.4.0"
+        from: "0.5.0"
     ),
 ],
 targets: [

@@ -10,7 +10,7 @@
 
 All notable changes to this package are documented here.
 
-## [Unreleased]
+## [0.5.0] - 2026-11-06
 
 ### Added
 
