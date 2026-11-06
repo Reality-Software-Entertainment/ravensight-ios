@@ -421,7 +421,8 @@ and are scrubbed too; symbol files are a later step.
 Per session: at most 30 captures, 3 of the same error, 6 a minute, and 10
 with a trail. Over a limit the capture is dropped silently. Captures made
 before Ravensight's first answer (at most 5) are held in memory and sent
-only once the answer says capture is on. Gameplay events keep their place
+only once the answer says capture is on; a `.error` log line never pushes a
+crash out of them. A saved crash older than 30 days is deleted unsent. Gameplay events keep their place
 in the queue ahead of errors.
 
 ### The trail
@@ -445,7 +446,7 @@ Ravensight.log("save failed", level: .error)      // also captured
   game's settings on the dashboard. The SDK reads it from Ravensight's
   answer and removes its hooks.
 * The player's opt-out, `stopAllTelemetry()` and `resetDeviceId()` remove
-  or reset it too; an opt-out deletes a saved crash file unsent.
+  or reset it too; an opt-out or a reset deletes a saved crash file unsent.
 
 A synthetic (Playtest) run does not install the crash handlers, since it
 never writes a file. Verified so far: unit tests with the handler called

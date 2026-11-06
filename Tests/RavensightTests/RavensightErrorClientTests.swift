@@ -251,6 +251,58 @@ final class RavensightErrorClientTests: XCTestCase {
         XCTAssertEqual(client.errorsCapped, 94)
     }
 
+    func testOnceTheCapsAreSpentACaptureIsNeverScrubbed() {
+        let transport = transport()
+        let client = makeClient(transport)
+        client.start()
+        flush(client)
+        for index in 0..<6 { capture(client, crash("burst \(String(UnicodeScalar(65 + index)!))")) }
+        settle(client)
+        var before = 0
+        client.onWorkQueue { before = RavensightErrorText.scrubCalls }
+        settle(client)
+        for index in 0..<20 { capture(client, crash("late \(String(UnicodeScalar(65 + index)!))")) }
+        settle(client)
+        var after = 0
+        client.onWorkQueue { after = RavensightErrorText.scrubCalls }
+        settle(client)
+        XCTAssertEqual(client.errorsCaptured, 6)
+        XCTAssertEqual(after, before, "with the bucket empty nothing is scrubbed")
+    }
+
+    func testManyLogLinesBeforeTheAnswerNeverPushOutACrash() {
+        let transport = transport()
+        transport.holdSuffix = "/settings"
+        let client = makeClient(transport)
+        client.start()
+        settle(client)
+        for index in 0..<20 { client.log("noise \(String(UnicodeScalar(65 + index)!))", level: .error) }
+        settle(client)
+        capture(client, crash("the real one"))
+        settle(client)
+        transport.release(RavensightResponse(
+            status: 200, body: try? JSONSerialization.data(withJSONObject: ["trackingEnabled": true])))
+        settle(client)
+        flush(client)
+        let sent = errors(transport)
+        XCTAssertTrue(sent.contains { $0["rs_message"] as? String == "the real one" && $0["rs_source"] as? String == "crash" })
+    }
+
+    func testManyTrailLinesNeverPushOutACrash() {
+        let transport = transport(errorCapture: ["enabled": true, "trail": true])
+        let client = makeClient(transport)
+        client.start()
+        flush(client)
+        for index in 0..<2_000 { client.log("frame \(index)", level: .info) }
+        settle(client)
+        capture(client, crash("the real one"))
+        flush(client)
+        let sent = errors(transport)
+        XCTAssertEqual(sent.count, 1)
+        XCTAssertEqual(sent.first?["rs_message"] as? String, "the real one")
+        XCTAssertEqual((sent.first?["rs_trail"] as? String)?.split(separator: "\n").count, 20)
+    }
+
     func testTheTrailCarriesTrackCallsAndLogLinesWhenTheSwitchIsOn() {
         let transport = transport(errorCapture: ["enabled": true, "trail": true])
         let client = makeClient(transport)
@@ -316,7 +368,7 @@ final class RavensightErrorClientTests: XCTestCase {
         let url = try XCTUnwrap(RavensightCrashFile.defaultURL(ingestKey: "gt_live_test", directory: directory))
         RavensightCrashFile.append(RavensightCapture(
             source: "crash", severity: "critical", message: "index 3 beyond bounds",
-            stack: "0 CoreFoundation", type: "NSRangeException", atSec: 1_700_000_100), to: url)
+            stack: "0 CoreFoundation", type: "NSRangeException", atSec: 1_799_990_100), to: url)
         let transport = transport()
         let client = makeClient(transport)
         client.start()
@@ -324,9 +376,43 @@ final class RavensightErrorClientTests: XCTestCase {
         flush(client)
         let sent = sentData(transport).filter { $0.name == "error" }
         XCTAssertEqual(sent.count, 1)
-        XCTAssertEqual(sent.first?.timestamp, 1_700_000_100)
+        XCTAssertEqual(sent.first?.timestamp, 1_799_990_100)
         XCTAssertEqual(sent.first?.data["rs_error_type"] as? String, "NSRangeException")
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path), "read once, then deleted")
+    }
+
+    func testASavedExceptionOlderThanThirtyDaysIsDeletedUnsent() throws {
+        let url = try XCTUnwrap(RavensightCrashFile.defaultURL(ingestKey: "gt_live_test", directory: directory))
+        let nowSec = clock.nowMs / 1000
+        RavensightCrashFile.append(crash("stale", at: nowSec - 31 * 86_400), to: url)
+        RavensightCrashFile.append(crash("fresh", at: nowSec - 29 * 86_400), to: url)
+        let transport = transport()
+        let client = makeClient(transport)
+        client.start()
+        flush(client)
+        flush(client)
+        XCTAssertEqual(errors(transport).compactMap { $0["rs_message"] as? String }, ["fresh"])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    func testAResetDeletesASavedExceptionAndTheHeldCrashes() throws {
+        let url = try XCTUnwrap(RavensightCrashFile.defaultURL(ingestKey: "gt_live_test", directory: directory))
+        let transport = transport()
+        transport.holdSuffix = "/settings"
+        let client = makeClient(transport)
+        client.start()
+        settle(client)
+        capture(client, crash("held"))
+        settle(client)
+        RavensightCrashFile.append(crash("saved"), to: url)
+        client.resetDeviceId()
+        settle(client)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path), "the saved record is deleted")
+        transport.release(RavensightResponse(
+            status: 200, body: try? JSONSerialization.data(withJSONObject: ["trackingEnabled": true])))
+        settle(client)
+        flush(client)
+        XCTAssertTrue(errors(transport).isEmpty, "nothing held under the old id is sent")
     }
 
     func testASavedExceptionIsDeletedUnsentWhenCaptureIsOff() throws {
@@ -361,13 +447,13 @@ final class RavensightErrorClientTests: XCTestCase {
     func testTheSystemsReportOfASavedExceptionIsNotSentTwice() throws {
         let url = try XCTUnwrap(RavensightCrashFile.defaultURL(ingestKey: "gt_live_test", directory: directory))
         RavensightCrashFile.append(RavensightCapture(
-            source: "crash", severity: "critical", message: "boom", stack: nil, type: "NSGenericException", atSec: 150), to: url)
+            source: "crash", severity: "critical", message: "boom", stack: nil, type: "NSGenericException", atSec: 1_799_999_150), to: url)
         let transport = transport()
         let client = makeClient(transport)
         client.start()
         flush(client)
         let abort = RavensightCrashDiagnostic(
-            signal: 6, exceptionType: 10, exceptionCode: 0, terminationReason: nil, frames: [], beginSec: 140, endSec: 160)
+            signal: 6, exceptionType: 10, exceptionCode: 0, terminationReason: nil, frames: [], beginSec: 1_799_999_140, endSec: 1_799_999_160)
         client.onWorkQueue { client.receiveCrashDiagnostics([abort]) }
         flush(client)
         XCTAssertEqual(errors(transport).compactMap { $0["rs_error_type"] as? String }, ["NSGenericException"])

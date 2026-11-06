@@ -100,7 +100,19 @@ enum RavensightErrorText {
         return result as String
     }
 
+    #if DEBUG
+    /// Scrub calls so far. Tests only: proves a capped capture is never scrubbed.
+    #if compiler(>=5.10)
+    nonisolated(unsafe) static var scrubCalls = 0
+    #else
+    static var scrubCalls = 0
+    #endif
+    #endif
+
     static func scrub(_ value: String) -> String {
+        #if DEBUG
+        scrubCalls += 1
+        #endif
         guard !value.isEmpty else { return value }
         var text = value
         for (pattern, template) in rules {
@@ -170,13 +182,19 @@ struct RavensightErrorCaps {
         refilledAtMs = nowMs
     }
 
-    /// True when one more capture with this key may be sent now; consumes
-    /// its share of every cap. False drops it silently.
-    mutating func admit(key: String, nowMs: Int64) -> Bool {
+    /// Refills the bucket; true while the session cap and the bucket have
+    /// room. Checked before any scrub or dedupe key; consumes nothing.
+    mutating func hasRoom(nowMs: Int64) -> Bool {
         let perMs = Double(RavensightErrorCaps.perMinute) / 60_000
         tokens = min(Double(RavensightErrorCaps.perMinute), tokens + Double(max(0, nowMs - refilledAtMs)) * perMs)
         refilledAtMs = nowMs
-        guard count < RavensightErrorCaps.total, tokens >= 1,
+        return count < RavensightErrorCaps.total && tokens >= 1
+    }
+
+    /// True when one more capture with this key may be sent now; consumes
+    /// its share of every cap. False drops it silently.
+    mutating func admit(key: String, nowMs: Int64) -> Bool {
+        guard hasRoom(nowMs: nowMs),
               perKeyCounts[key, default: 0] < RavensightErrorCaps.perKey else { return false }
         count += 1
         tokens -= 1
@@ -244,9 +262,11 @@ extension RavensightErrorText {
 // MARK: Crash file
 
 /// The file an Objective-C exception is written to as the app dies, read
-/// and deleted on the next launch. At most 5 reports, already scrubbed.
+/// and deleted on the next launch. At most 5 reports, already scrubbed;
+/// one older than 30 days is deleted unsent.
 enum RavensightCrashFile {
     static let maxReports = 5
+    static let maxAgeSec: Int64 = 30 * 24 * 60 * 60
 
     static func defaultURL(ingestKey: String, directory: URL? = nil) -> URL? {
         guard let queue = RavensightQueueStore.defaultFileURL(ingestKey: ingestKey, directory: directory) else { return nil }
@@ -280,11 +300,12 @@ enum RavensightCrashFile {
         try? file.setResourceValues(values)
     }
 
-    static func load(_ url: URL) -> [RavensightCapture] {
+    static func load(_ url: URL, nowSec: Int64 = Int64(Date().timeIntervalSince1970)) -> [RavensightCapture] {
         guard let data = try? Data(contentsOf: url),
               let array = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else { return [] }
         return array.prefix(maxReports).compactMap { object in
             guard let message = object["message"] as? String else { return nil }
+            if let at = RavensightCore.numberValue(object["atSec"]), Int64(at) < nowSec - maxAgeSec { return nil }
             return RavensightCapture(
                 source: object["source"] as? String ?? "crash",
                 severity: object["severity"] as? String ?? "critical",

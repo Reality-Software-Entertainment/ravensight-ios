@@ -129,13 +129,14 @@ final class RavensightErrorTextTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: dir) }
         let url = try XCTUnwrap(RavensightCrashFile.defaultURL(ingestKey: "gt_live_x", directory: dir))
         XCTAssertTrue(url.lastPathComponent.hasPrefix("crash-"))
+        let at = Int64(Date().timeIntervalSince1970)
         for index in 0..<7 {
             RavensightCrashFile.append(
-                RavensightCapture(source: "crash", severity: "critical", message: "m\(index)", stack: "s", type: "T", atSec: 100), to: url)
+                RavensightCapture(source: "crash", severity: "critical", message: "m\(index)", stack: "s", type: "T", atSec: at), to: url)
         }
         let loaded = RavensightCrashFile.load(url)
         XCTAssertEqual(loaded.count, 5)
-        XCTAssertEqual(loaded.first, RavensightCapture(source: "crash", severity: "critical", message: "m0", stack: "s", type: "T", atSec: 100))
+        XCTAssertEqual(loaded.first, RavensightCapture(source: "crash", severity: "critical", message: "m0", stack: "s", type: "T", atSec: at))
         RavensightCrashFile.delete(url)
         XCTAssertTrue(RavensightCrashFile.load(url).isEmpty)
     }

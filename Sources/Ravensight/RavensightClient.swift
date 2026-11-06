@@ -179,6 +179,8 @@ public final class RavensightClient: @unchecked Sendable {
         var deviceId = ""
         var stats = RavensightStats()
         var capturingErrors = false
+        /// Capture installed and the game's trail switch on.
+        var trailing = false
     }
 
     private struct Waiter {
@@ -1007,6 +1009,7 @@ public final class RavensightClient: @unchecked Sendable {
                 workQueue.async {
                     self.core.replaceDeviceId("")
                     self.deleteQueueFile()
+                    self.forgetPendingCrashes()
                     self.stateChanged()
                 }
             }
@@ -1027,6 +1030,7 @@ public final class RavensightClient: @unchecked Sendable {
         workQueue.async {
             self.core.replaceDeviceId(fresh)
             self.deleteQueueFile()
+            self.forgetPendingCrashes()
             self.resetErrorSession()
             self.stateChanged()
         }
@@ -1119,6 +1123,9 @@ public final class RavensightClient: @unchecked Sendable {
     /// app's other logs, so this and your track calls are the whole trail.
     public func log(_ message: String, level: RavensightLogLevel) {
         if isInert { return }
+        // With the trail off, an info or warning line is dropped here,
+        // before it is copied onto the work queue.
+        if level != .error && !readSnapshot().trailing { return }
         workQueue.async {
             self.addTrailLine(level.rawValue, message)
             if level == .error,
@@ -1200,7 +1207,7 @@ public final class RavensightClient: @unchecked Sendable {
     /// deleted, and captured (held until the first answer).
     private func loadCrashFile() {
         guard let url = crashFileURL else { return }
-        let reports = RavensightCrashFile.load(url)
+        let reports = RavensightCrashFile.load(url, nowSec: now() / 1000)
         RavensightCrashFile.delete(url)
         guard !reports.isEmpty else { return }
         var times = defaults.array(forKey: RavensightClient.exceptionTimesKey) as? [Int64] ?? []
@@ -1237,14 +1244,23 @@ public final class RavensightClient: @unchecked Sendable {
     func capture(_ capture: RavensightCapture) -> Bool {
         guard errorHooked, core.isActive else { return false }
         if !core.errorCaptureAnswered {
-            if bootErrors.count < RavensightClient.maxBootErrors {
-                bootErrors.append(capture)
-            } else {
+            // A full hold makes room for a crash by dropping the oldest
+            // warning (a log line), so warnings never push a crash out.
+            if bootErrors.count >= RavensightClient.maxBootErrors {
                 errorsCapped += 1
+                guard capture.severity != "warning",
+                      let at = bootErrors.firstIndex(where: { $0.severity == "warning" }) else { return false }
+                bootErrors.remove(at: at)
             }
+            bootErrors.append(capture)
             return false
         }
         let nowMs = now()
+        // The session cap and the bucket before any scrub or dedupe key.
+        guard errorCaps.hasRoom(nowMs: nowMs) else {
+            errorsCapped += 1
+            return false
+        }
         let built = RavensightErrorText.eventData(capture, trail: nil)
         guard errorCaps.admit(key: built.key, nowMs: nowMs) else {
             errorsCapped += 1
@@ -1263,6 +1279,12 @@ public final class RavensightClient: @unchecked Sendable {
     private func addTrailLine(_ level: String, _ text: String) {
         guard errorHooked, core.errorTrailEnabled else { return }
         trail.add(level: level, text: text, elapsedMs: now() - trailStartMs)
+    }
+
+    /// A new identity: no crash saved or held under the old one is sent.
+    private func forgetPendingCrashes() {
+        RavensightCrashFile.delete(crashFileURL)
+        bootErrors.removeAll()
     }
 
     /// A new session (or a new identity) gets fresh caps and an empty trail.
@@ -1528,7 +1550,8 @@ public final class RavensightClient: @unchecked Sendable {
             reason: core.statusReason,
             deviceId: snapshot.deviceId,
             stats: stats,
-            capturingErrors: errorHooked
+            capturingErrors: errorHooked,
+            trailing: errorHooked && core.errorTrailEnabled
         )
         snapshotLock.unlock()
     }
