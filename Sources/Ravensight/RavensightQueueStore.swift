@@ -9,7 +9,8 @@ import Foundation
 /// the /session answer gave it, so events a crash, a kill or a lost network
 /// left behind are filed under their own session, build and platform when
 /// the next launch sends them. Version 1 files are read as groups without an
-/// origin. Session tokens and signing secrets are never written.
+/// origin. Session tokens, signing secrets and an error's rs_trail are
+/// never written.
 ///
 /// Only touched on the client's work queue (and in the initializer, before
 /// the client is shared), so it needs no lock of its own.
@@ -141,7 +142,13 @@ final class RavensightQueueStore {
             "version": RavensightQueueStore.formatVersion,
             "groups": trimmed.map { group -> [String: Any] in
                 var entry: [String: Any] = [
-                    "events": group.events.map { ["event": $0.name, "data": $0.data, "timestamp": $0.timestamp] as [String: Any] },
+                    // A trail never reaches the queue file (queue rule 3): the
+                    // event keeps it in memory; one restored goes without it.
+                    "events": group.events.map { event -> [String: Any] in
+                        var data = event.data
+                        data.removeValue(forKey: "rs_trail")
+                        return ["event": event.name, "data": data, "timestamp": event.timestamp]
+                    },
                 ]
                 if let origin = group.origin { entry["origin"] = origin }
                 return entry

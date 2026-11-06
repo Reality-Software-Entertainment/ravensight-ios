@@ -413,15 +413,23 @@ struct RavensightCore {
         // Gameplay events keep their place ahead of automatic errors: a full
         // queue drops the incoming error, or the oldest queued error, before
         // any gameplay event.
-        if pendingEvents.count >= config.maxQueueSize && RavensightCore.isAutomaticError(payload) {
+        // The queue rule for every SDK: at the cap the oldest capture goes
+        // first, whichever event is coming in; a capture never evicts a
+        // gameplay event, so with no capture queued an incoming one is dropped.
+        if pendingEvents.count >= config.maxQueueSize && automatic &&
+            firstEvictableCapture() == nil {
             counters.dropped += 1
             return false
         }
         while pendingEvents.count >= config.maxQueueSize {
-            if let at = pendingEvents.firstIndex(where: { RavensightCore.isAutomaticError($0.data) }) {
+            if let at = firstEvictableCapture() {
                 pendingEvents.remove(at: at)
             } else {
-                pendingEvents.removeFirst() // drop oldest so the newest always survive
+                // Drop the oldest so the newest always survive, but never a
+                // capture already on its way.
+                let inFlight = min(inFlightCount, pendingEvents.count)
+                let at = pendingEvents.indices.first { !($0 < inFlight && RavensightCore.isAutomaticError(pendingEvents[$0].data)) } ?? 0
+                pendingEvents.remove(at: at)
             }
             counters.dropped += 1
         }
@@ -444,6 +452,13 @@ struct RavensightCore {
 
     /// True for an error event an automatic hook queued (rs_kind error with
     /// an rs_source other than manual). A manual trackError is gameplay.
+    /// The oldest queued capture outside the batch in flight, or nil. A
+    /// capture already on its way is never evicted.
+    private func firstEvictableCapture() -> Int? {
+        let start = min(inFlightCount, pendingEvents.count)
+        return pendingEvents[start...].firstIndex { RavensightCore.isAutomaticError($0.data) }
+    }
+
     static func isAutomaticError(_ data: [String: Any]) -> Bool {
         guard data["rs_kind"] as? String == "error", let source = data["rs_source"] as? String else { return false }
         return !source.isEmpty && source != "manual"

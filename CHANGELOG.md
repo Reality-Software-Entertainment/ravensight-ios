@@ -37,6 +37,11 @@ device field contracts.
   times (`atSec`) are sent in milliseconds like every other event.
 - A capture saved by the last launch is restored into the live queue and
   sent under the current session, like every saved event.
+- On a full queue an incoming capture now evicts the oldest queued capture
+  (it was dropped before); with no capture queued it is still dropped, and a
+  capture never evicts a gameplay event.
+- An error's `rs_trail` is never written to the queue file; a capture
+  restored from it is sent without its trail.
 - Backoff jitter is a factor in [0.5, 1) (was plus or minus 20 percent);
   `flush()` no longer cuts a `Retry-After` wait short.
 - The 8 KB event check counts an error event's message, stack and trail

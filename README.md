@@ -564,10 +564,12 @@ lost connection, a crash, a kill and a build update.
   flush timer, at 50 queued, on `flush()`, on background and on quit. A
   flush keeps sending batches until the queue drains.
 * **Offline queue.** Events accumulate up to `maxQueueSize`. Past that the
-  oldest are dropped so the newest are always kept, except that an
-  automatic error event (`rs_kind: error` with an `rs_source` other than
-  `manual`) is always dropped before any gameplay event, and gameplay
-  events queue ahead of automatic errors.
+  oldest are dropped so the newest are always kept, except that the oldest
+  automatic error capture (`rs_kind: error` with an `rs_source` other than
+  `manual`) always goes first, and a capture never pushes out a gameplay
+  event (with no capture queued, an incoming capture is dropped). Gameplay
+  events, your own `trackError` included, queue ahead of automatic
+  captures.
 * **Original session, build and platform.** Every event carries its own
   timestamp in milliseconds, set when it was tracked, and the `origin` the
   session answer gave (an opaque signed stamp of that session, build and
@@ -664,7 +666,8 @@ excluded from backups), in queue format version 2:
   origin of the session it was tracked in, with its original timestamp;
   version 1 files from earlier releases are read as events without an
   origin;
-* session tokens and signing secrets are never written;
+* session tokens, signing secrets and an error's `rs_trail` are never
+  written;
 * it is deleted when the player opts out (also at launch, when a saved
   opt-out is found), on `stopAllTelemetry`, on `resetDeviceId` (before
   `start()` too, where every queue file is removed), on the kill switch,

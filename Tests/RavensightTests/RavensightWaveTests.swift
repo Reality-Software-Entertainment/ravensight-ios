@@ -415,4 +415,106 @@ final class RavensightWaveTests: XCTestCase {
         _ = first.resetDeviceId()
         XCTAssertFalse(defaults.bool(forKey: RavensightClient.attributionKey), "a reset forgets the flag")
     }
+
+    // MARK: The queue rules agreed for every SDK
+
+    private let capture: [String: Any] = ["rs_kind": "error", "rs_severity": "error", "rs_message": "x", "rs_source": "crash"]
+
+    func testRule1GameplayGoesBeforeCapturesAndAGamesOwnErrorIsGameplay() throws {
+        var core = makeCore()
+        core.track(name: "capture_1", data: capture, nowMs: nowMs)
+        core.track(name: "own_error", data: ["rs_kind": "error", "rs_severity": "error", "rs_message": "mine"], nowMs: nowMs)
+        core.track(name: "capture_2", data: capture, nowMs: nowMs)
+        core.track(name: "play", data: nil, nowMs: nowMs)
+        open(&core)
+        let (request, _) = try XCTUnwrap(nextBatch(&core))
+        XCTAssertEqual(events(request).map { $0["event"] as? String ?? "" }, ["own_error", "play", "capture_1", "capture_2"])
+    }
+
+    func testRule2AnIncomingCaptureEvictsTheOldestCaptureAndNeverGameplay() {
+        var core = makeCore(maxQueueSize: 3)
+        core.track(name: "play_1", data: nil, nowMs: nowMs)
+        core.track(name: "capture_1", data: capture, nowMs: nowMs)
+        core.track(name: "play_2", data: nil, nowMs: nowMs)
+        XCTAssertTrue(core.track(name: "capture_2", data: capture, nowMs: nowMs))
+        XCTAssertEqual(core.pendingEvents.map { $0.name }, ["play_1", "play_2", "capture_2"])
+        core.track(name: "play_3", data: nil, nowMs: nowMs)
+        XCTAssertEqual(core.pendingEvents.map { $0.name }, ["play_1", "play_2", "play_3"])
+        XCTAssertFalse(core.track(name: "capture_3", data: capture, nowMs: nowMs), "no capture queued: dropped")
+        XCTAssertEqual(core.pendingEvents.map { $0.name }, ["play_1", "play_2", "play_3"])
+        XCTAssertEqual(core.stats.dropped, 3)
+    }
+
+    func testRule3TheTrailNeverReachesTheQueueFile() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("rs-wave-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = RavensightQueueStore(fileURL: dir.appendingPathComponent("queue.json"))
+        var data = capture
+        data["rs_trail"] = "secret trail"
+        XCTAssertTrue(store.save([.init(origin: nil, events: [RavensightEvent(name: "error", data: data, timestamp: nowMs)])]))
+        let text = try String(contentsOf: store.fileURL)
+        XCTAssertFalse(text.contains("rs_trail"))
+        XCTAssertFalse(text.contains("secret trail"))
+        let loaded = store.load(nowMs: nowMs).groups.flatMap { $0.events }
+        XCTAssertNil(loaded.first?.data["rs_trail"])
+        XCTAssertTrue(RavensightCore.isAutomaticError(loaded.first?.data ?? [:]), "the capture flag survives")
+    }
+
+    func testRule3OptOutAndResetDeletePersistedCaptures() {
+        let suite = "rs-wave-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("rs-wave-\(UUID())")
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: dir)
+        }
+        var config = RavensightConfiguration(ingestKey: "gt_live_test")
+        config.apiUrl = "https://fake.test"
+        config.trackLifecycleEvents = false
+        config.flushInterval = 0
+        let client = RavensightClient(configuration: config, transport: FakeTransport(), now: nil, defaults: defaults,
+                                      environment: [:], isBackgroundLaunch: { false }, installsLifecycleObservers: false,
+                                      queueDirectory: dir)
+        let file = RavensightQueueStore.defaultFileURL(ingestKey: "gt_live_test", directory: dir)!
+        func settle() { client.workQueue.sync {}; Thread.sleep(forTimeInterval: 0.4); client.workQueue.sync {} }
+        client.track("error", data: capture)
+        settle()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+        _ = client.resetDeviceId()
+        settle()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path), "a reset deletes persisted captures")
+        client.track("error", data: capture)
+        settle()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+        client.setTrackingEnabled(false)
+        settle()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path), "an opt-out deletes them")
+    }
+
+    func testACaptureInABatchInFlightIsNeverEvicted() throws {
+        var core = makeCore(maxQueueSize: 2)
+        open(&core)
+        core.track(name: "capture_1", data: capture, nowMs: nowMs)
+        let (_, count) = try XCTUnwrap(nextBatch(&core))
+        core.noteInFlight(count)
+        core.track(name: "play", data: nil, nowMs: nowMs)
+        XCTAssertFalse(core.track(name: "capture_2", data: capture, nowMs: nowMs),
+                       "the only capture is in flight: the incoming one is dropped, not the one being sent")
+        XCTAssertEqual(core.pendingEvents.map { $0.name }, ["capture_1", "play"])
+        core.track(name: "play_2", data: nil, nowMs: nowMs) // full: the oldest that is not in flight goes
+        XCTAssertEqual(core.pendingEvents.map { $0.name }, ["capture_1", "play_2"])
+        _ = core.handle(response: RavensightResponse(status: 202), for: .batch(count: count), nowMs: nowMs)
+        XCTAssertEqual(core.pendingEvents.map { $0.name }, ["play_2"])
+    }
+
+    func testTheQueueFileIsExcludedFromBackupOnEveryWrite() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("rs-wave-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = RavensightQueueStore(fileURL: dir.appendingPathComponent("queue.json"))
+        for name in ["a", "b"] {
+            XCTAssertTrue(store.save([.init(origin: nil, events: [RavensightEvent(name: name, data: [:], timestamp: nowMs)])]))
+            let values = try store.fileURL.resourceValues(forKeys: [.isExcludedFromBackupKey])
+            XCTAssertEqual(values.isExcludedFromBackup, true, "after writing \(name)")
+        }
+    }
 }
