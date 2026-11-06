@@ -163,6 +163,14 @@ public final class RavensightClient: @unchecked Sendable {
 
     private let snapshotLock = NSLock()
     private var snapshot = Snapshot()
+    /// Calls to setTrackingEnabled and setEnabled whose choice the snapshot
+    /// already shows but the core, on the work queue, has not applied yet.
+    /// While any is pending, a snapshot published from the core keeps the
+    /// caller's enabled and opted out values: otherwise a publish that ran in
+    /// between (start, the queue load, a timer) wrote the core's old value
+    /// back, and a track right after the player's yes was refused and lost.
+    /// Guarded by snapshotLock.
+    private var pendingChoices = 0
     private var statusHandler: ((String?) -> Void)?
     private var flushHandler: ((RavensightFlushOutcome) -> Void)?
 
@@ -302,6 +310,11 @@ public final class RavensightClient: @unchecked Sendable {
         } else if token != nil && runId == nil {
             core.stop(reason: RavensightCore.Reason.sessionFailed)
         }
+        if let store = self.queueStore {
+            // No file contents, only that the exclusion did not take.
+            let warning: (String) -> Void = { message in print("Ravensight: \(message)") }
+            store.onExclusionFailure = warning
+        }
         self.core = core
         self.snapshot.deviceId = durableId
         self.persistedRevision = self.core.queueRevision
@@ -389,7 +402,10 @@ public final class RavensightClient: @unchecked Sendable {
     private func deleteQueueFile() {
         restoreDue = false
         persistScheduled = false
-        if let url = queueFileURL { try? FileManager.default.removeItem(at: url) }
+        if let url = queueFileURL {
+            try? FileManager.default.removeItem(at: url)
+            try? FileManager.default.removeItem(at: url.appendingPathExtension("tmp"))
+        }
         persistedRevision = core.queueRevision
     }
 
@@ -906,6 +922,7 @@ public final class RavensightClient: @unchecked Sendable {
         var minted: String?
         snapshotLock.lock()
         snapshot.optedOut = !enabled
+        pendingChoices += 1
         if enabled && !isInert && snapshot.deviceId.isEmpty {
             let id = RavensightClient.loadOrCreateDeviceId(defaults)
             snapshot.deviceId = id
@@ -916,6 +933,7 @@ public final class RavensightClient: @unchecked Sendable {
         workQueue.async {
             if let id = minted { self.core.replaceDeviceId(id) }
             self.core.setOptedOut(!enabled)
+            self.choiceApplied()
             if !enabled { self.deleteQueueFile() }
             if enabled { self.queueGameStartedIfDue() }
             self.stateChanged()
@@ -930,9 +948,11 @@ public final class RavensightClient: @unchecked Sendable {
     public func setEnabled(_ enabled: Bool) {
         snapshotLock.lock()
         snapshot.enabled = enabled
+        pendingChoices += 1
         snapshotLock.unlock()
         workQueue.async {
             self.core.setEnabled(enabled)
+            self.choiceApplied()
             if enabled {
                 self.restoreQueueIfDue()
                 self.queueGameStartedIfDue()
@@ -1600,9 +1620,11 @@ public final class RavensightClient: @unchecked Sendable {
         snapshotLock.lock()
         // deviceId is the durable id, set at creation and by resetDeviceId
         // only, so it is carried over rather than read from the core.
+        // A choice the caller made that the core has not applied yet wins.
+        let callerChoicePending = pendingChoices > 0
         snapshot = Snapshot(
-            enabled: core.enabled,
-            optedOut: core.optedOut,
+            enabled: callerChoicePending ? snapshot.enabled : core.enabled,
+            optedOut: callerChoicePending ? snapshot.optedOut : core.optedOut,
             trackingEnabled: core.trackingEnabled && core.stopReason == nil,
             sessionReady: valid,
             sessionToken: valid ? core.sessionToken : nil,
@@ -1613,6 +1635,14 @@ public final class RavensightClient: @unchecked Sendable {
             capturingErrors: errorHooked,
             trailing: errorHooked && core.errorTrailEnabled
         )
+        snapshotLock.unlock()
+    }
+
+    /// Work queue only: one setTrackingEnabled or setEnabled has reached the
+    /// core, so the core is the truth again once none is pending.
+    private func choiceApplied() {
+        snapshotLock.lock()
+        pendingChoices -= 1
         snapshotLock.unlock()
     }
 

@@ -44,8 +44,42 @@ final class RavensightQueueStore {
 
     let fileURL: URL
 
+    /// The one temporary file an atomic write goes through, beside fileURL.
+    var tempURL: URL { return fileURL.appendingPathExtension("tmp") }
+
+    /// Told (with no file contents) when the backup exclusion could not be
+    /// set even after one retry. The client logs it once.
+    var onExclusionFailure: ((String) -> Void)?
+    private var warnedExclusion = false
+
+    /// Sets the backup exclusion on a URL. A test seam; the default asks
+    /// the file system.
+    var setExcluded: (URL) throws -> Void = { url in
+        var target = url
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try target.setResourceValues(values)
+    }
+
     init(fileURL: URL) {
         self.fileURL = fileURL
+    }
+
+    /// Marks url excluded from device backups, checks it took, and retries
+    /// once. The queue holds scrubbed error captures and origin stamps.
+    @discardableResult
+    func excludeFromBackup(_ url: URL) -> Bool {
+        for _ in 0..<2 {
+            if (try? setExcluded(url)) != nil,
+               (try? url.resourceValues(forKeys: [.isExcludedFromBackupKey]))?.isExcludedFromBackup == true {
+                return true
+            }
+        }
+        if !warnedExclusion {
+            warnedExclusion = true
+            onExclusionFailure?("could not exclude the queue file from device backups (\(url.lastPathComponent))")
+        }
+        return false
     }
 
     /// Application Support/Ravensight/queue-<key hash>.json. The key hash
@@ -76,6 +110,12 @@ final class RavensightQueueStore {
     /// Reads the file. A missing, unreadable or malformed file is an empty
     /// queue. Events older than maxAgeSeconds are left out.
     func load(nowMs: Int64) -> (groups: [Group], dropped: Int) {
+        // A write a crash cut short leaves its temporary file behind.
+        try? FileManager.default.removeItem(at: tempURL)
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            // A file an earlier release wrote may not carry the exclusion.
+            excludeFromBackup(fileURL)
+        }
         guard let data = try? Data(contentsOf: fileURL),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let version = (object["version"] as? NSNumber)?.intValue, version == 1 || version == 2,
@@ -160,14 +200,20 @@ final class RavensightQueueStore {
             try FileManager.default.createDirectory(
                 at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true
             )
-            try data.write(to: fileURL, options: .atomic)
-            // A transient queue has no business in a device backup.
-            var url = fileURL
-            var values = URLResourceValues()
-            values.isExcludedFromBackup = true
-            try? url.setResourceValues(values)
+            // Written to a temporary file that is excluded from backups
+            // before it takes the queue file's place, so no copy of the queue
+            // is ever eligible for a backup.
+            try data.write(to: tempURL)
+            excludeFromBackup(tempURL)
+            if rename(tempURL.path, fileURL.path) != 0 {
+                try? FileManager.default.removeItem(at: tempURL)
+                return false
+            }
+            // A rename keeps the attribute; checked again on the final file.
+            excludeFromBackup(fileURL)
             return true
         } catch {
+            try? FileManager.default.removeItem(at: tempURL)
             return false
         }
     }
@@ -184,13 +230,16 @@ final class RavensightQueueStore {
             base = support.appendingPathComponent("Ravensight", isDirectory: true)
         }
         let files = (try? FileManager.default.contentsOfDirectory(at: base, includingPropertiesForKeys: nil)) ?? []
-        for file in files where file.lastPathComponent.hasPrefix("queue-") && file.pathExtension == "json" {
+        for file in files where file.lastPathComponent.hasPrefix("queue-") &&
+            (file.pathExtension == "json" || file.lastPathComponent.hasSuffix(".json.tmp")) {
             try? FileManager.default.removeItem(at: file)
         }
     }
 
+    /// Deletes the queue file and any temporary file beside it.
     func delete() {
         try? FileManager.default.removeItem(at: fileURL)
+        try? FileManager.default.removeItem(at: tempURL)
     }
 
     var exists: Bool {

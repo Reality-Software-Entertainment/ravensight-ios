@@ -42,6 +42,15 @@ device field contracts.
   capture never evicts a gameplay event.
 - An error's `rs_trail` is never written to the queue file; a capture
   restored from it is sent without its trail.
+- Fixed: an event tracked right after the player's yes (or after
+  `setEnabled(true)`) could be refused and lost when a work queue task
+  republished the client state before the yes reached the core. The
+  caller's choice now wins until the core has applied it.
+- The queue file is written through one temporary file that is excluded
+  from backups before it is renamed into place; the exclusion is checked
+  and retried once (one warning, no contents, if it still fails), applied
+  to an existing file on load, and a leftover temporary file is deleted on
+  load, a failed write, an empty queue, opt-out and id reset.
 - Backoff jitter is a factor in [0.5, 1) (was plus or minus 20 percent);
   `flush()` no longer cuts a `Retry-After` wait short.
 - The 8 KB event check counts an error event's message, stack and trail

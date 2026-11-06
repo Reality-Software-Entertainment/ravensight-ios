@@ -517,4 +517,112 @@ final class RavensightWaveTests: XCTestCase {
             XCTAssertEqual(values.isExcludedFromBackup, true, "after writing \(name)")
         }
     }
+
+    // MARK: The queue file's temporary file and backup exclusion
+
+    private func tempStore() -> (RavensightQueueStore, URL) {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("rs-wave-\(UUID())")
+        return (RavensightQueueStore(fileURL: dir.appendingPathComponent("queue-x.json")), dir)
+    }
+
+    private func oneGroup(_ name: String = "a") -> [RavensightQueueStore.Group] {
+        return [.init(origin: nil, events: [RavensightEvent(name: name, data: [:], timestamp: nowMs)])]
+    }
+
+    func testTheTemporaryFileIsExcludedBeforeTheRenameAndNoneIsLeft() throws {
+        let (store, dir) = tempStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        var excluded: [String] = []
+        let real = store.setExcluded
+        store.setExcluded = { url in
+            excluded.append(url.lastPathComponent)
+            try real(url)
+        }
+        XCTAssertTrue(store.save(oneGroup()))
+        XCTAssertEqual(excluded, ["queue-x.json.tmp", "queue-x.json"], "the temp file first, then the final one")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.tempURL.path))
+        XCTAssertEqual(try store.fileURL.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup, true)
+    }
+
+    func testAFailedExclusionIsRetriedOnceAndWarnedWithoutContents() {
+        let (store, dir) = tempStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        var attempts = 0
+        var warnings: [String] = []
+        store.setExcluded = { _ in
+            attempts += 1
+            throw CocoaError(.fileWriteNoPermission)
+        }
+        store.onExclusionFailure = { warnings.append($0) }
+        XCTAssertTrue(store.save(oneGroup("secret_event_name")))
+        XCTAssertEqual(attempts, 4, "two tries on the temp file, two on the final file")
+        XCTAssertEqual(warnings.count, 1, "warned once")
+        XCTAssertFalse(warnings[0].contains("secret_event_name"))
+    }
+
+    func testAFailedRenameDeletesTheTemporaryFile() throws {
+        let (store, dir) = tempStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        // A non-empty directory where the queue file goes: the rename fails.
+        try FileManager.default.createDirectory(at: store.fileURL, withIntermediateDirectories: true)
+        try Data("x".utf8).write(to: store.fileURL.appendingPathComponent("keep"))
+        XCTAssertFalse(store.save(oneGroup()))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.tempURL.path))
+    }
+
+    func testEveryDeletePathAndLoadRemoveALeftoverTemporaryFile() throws {
+        let (store, dir) = tempStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        func plant() throws { try Data("partial".utf8).write(to: store.tempURL) }
+        try plant()
+        _ = store.load(nowMs: nowMs)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.tempURL.path), "load sweeps it")
+        try plant()
+        store.delete()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.tempURL.path), "delete sweeps it")
+        XCTAssertTrue(store.save(oneGroup()))
+        try plant()
+        XCTAssertTrue(store.save([]), "an empty queue deletes the file")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.fileURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.tempURL.path), "and its temp file")
+    }
+
+    func testLoadAppliesTheExclusionToAnExistingFile() throws {
+        let (store, dir) = tempStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try Data("{\"version\":2,\"groups\":[]}".utf8).write(to: store.fileURL) // an older release's file
+        XCTAssertNotEqual(try store.fileURL.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup, true)
+        _ = store.load(nowMs: nowMs)
+        XCTAssertEqual(try store.fileURL.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup, true)
+    }
+
+    func testOptOutAndResetRemoveALeftoverTemporaryFile() throws {
+        let suite = "rs-wave-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("rs-wave-\(UUID())")
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: dir)
+        }
+        var config = RavensightConfiguration(ingestKey: "gt_live_test")
+        config.apiUrl = "https://fake.test"
+        config.trackLifecycleEvents = false
+        config.flushInterval = 0
+        let client = RavensightClient(configuration: config, transport: FakeTransport(), now: nil, defaults: defaults,
+                                      environment: [:], isBackgroundLaunch: { false }, installsLifecycleObservers: false,
+                                      queueDirectory: dir)
+        let temp = RavensightQueueStore.defaultFileURL(ingestKey: "gt_live_test", directory: dir)!.appendingPathExtension("tmp")
+        client.workQueue.sync {}
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try Data("partial".utf8).write(to: temp)
+        _ = client.resetDeviceId()
+        client.workQueue.sync {}
+        XCTAssertFalse(FileManager.default.fileExists(atPath: temp.path), "a reset sweeps it")
+        try Data("partial".utf8).write(to: temp)
+        client.setTrackingEnabled(false)
+        client.workQueue.sync {}
+        XCTAssertFalse(FileManager.default.fileExists(atPath: temp.path), "an opt-out sweeps it")
+    }
 }

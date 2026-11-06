@@ -217,6 +217,33 @@ final class RavensightPublicBuildTests: XCTestCase {
         XCTAssertEqual(next.deviceId, id)
     }
 
+    /// The race behind the old intermittent failure, forced: a snapshot
+    /// published from the core between the yes and the core applying it
+    /// wrote "opted out" back, so a track right after the yes was refused
+    /// and the event lost.
+    func testATrackRightAfterTheYesIsKeptWhenAPublishRunsInBetween() {
+        let transport = FakeTransport()
+        let client = makeClient(transport: transport) { $0.consent = .optIn }
+        client.start()
+        settle(client)
+        let first = DispatchSemaphore(value: 0)
+        let second = DispatchSemaphore(value: 0)
+        client.workQueue.async { first.wait() }
+        client.workQueue.async { client.stateChanged() } // a publish from the old core state
+        client.workQueue.async { second.wait() }
+        client.setTrackingEnabled(true) // its core update queues behind the gates
+        first.signal()
+        // Let the publish run; the queue then waits on the second gate.
+        let published = expectation(description: "publish ran")
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { published.fulfill() }
+        wait(for: [published], timeout: 2)
+        XCTAssertFalse(client.isOptedOut, "the yes still shows")
+        XCTAssertTrue(client.track("right_after_yes"), "not refused")
+        second.signal()
+        flushAndWait(client)
+        XCTAssertEqual(sentEvents(transport).map { $0.name }, ["right_after_yes"], "and delivered, not lost")
+    }
+
     func testOptInRevokeKeepsTheDeviceIdAndResetIsSeparate() {
         let transport = FakeTransport()
         let client = makeClient(transport: transport) { $0.consent = .optIn }
