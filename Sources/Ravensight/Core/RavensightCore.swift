@@ -208,6 +208,15 @@ struct RavensightCore {
     /// cleared by the next success.
     private(set) var lastFailure: String?
 
+    /// The game's error capture switches from the settings or session
+    /// answer (errorCapture: { enabled, trail }). Absent keeps what we had:
+    /// enabled, no trail.
+    private(set) var errorCaptureEnabled = true
+    private(set) var errorTrailEnabled = false
+    /// True once a settings or session answer has been read, so boot
+    /// errors held before it can be sent or discarded.
+    private(set) var errorCaptureAnswered = false
+
     var configExperiments: [String: String] = [:]
     var configExperimentDevice: String = ""
     private(set) var sessionToken: String?
@@ -367,8 +376,19 @@ struct RavensightCore {
             counters.dropped += 1
             return false
         }
+        // Gameplay events keep their place ahead of automatic errors: a full
+        // queue drops the incoming error, or the oldest queued error, before
+        // any gameplay event.
+        if pendingEvents.count >= config.maxQueueSize && RavensightCore.isAutomaticError(payload) {
+            counters.dropped += 1
+            return false
+        }
         while pendingEvents.count >= config.maxQueueSize {
-            pendingEvents.removeFirst() // drop oldest so the newest always survive
+            if let at = pendingEvents.firstIndex(where: { RavensightCore.isAutomaticError($0.data) }) {
+                pendingEvents.remove(at: at)
+            } else {
+                pendingEvents.removeFirst() // drop oldest so the newest always survive
+            }
             counters.dropped += 1
         }
         pendingEvents.append(RavensightEvent(
@@ -378,6 +398,23 @@ struct RavensightCore {
         ))
         counters.accepted += 1
         return true
+    }
+
+    /// True for an error event an automatic hook queued (rs_kind error with
+    /// an rs_source other than manual). A manual trackError is gameplay.
+    static func isAutomaticError(_ data: [String: Any]) -> Bool {
+        guard data["rs_kind"] as? String == "error", let source = data["rs_source"] as? String else { return false }
+        return !source.isEmpty && source != "manual"
+    }
+
+    /// Reads errorCapture: { enabled, trail } from a settings or session
+    /// answer. Absent keeps what we had; either way the answer has come.
+    private mutating func readErrorCapture(_ object: [String: Any]?) {
+        if let answer = object?["errorCapture"] as? [String: Any] {
+            errorCaptureEnabled = (answer["enabled"] as? Bool) != false
+            errorTrailEnabled = (answer["trail"] as? Bool) == true
+        }
+        errorCaptureAnswered = true
     }
 
     /// Puts events loaded from the persisted queue back. Events that were
@@ -594,10 +631,11 @@ struct RavensightCore {
 
         switch response.status {
         case 200:
-            if let object = response.json as? [String: Any],
-               let flag = object["trackingEnabled"] as? Bool, !flag {
+            let object = response.json as? [String: Any]
+            if let flag = object?["trackingEnabled"] as? Bool, !flag {
                 return killSwitch()
             }
+            readErrorCapture(object)
             // Malformed bodies assume tracking is on, like every other SDK.
             trackingEnabled = true
             return []
@@ -622,6 +660,7 @@ struct RavensightCore {
         if response.status == 201, let token = token, !token.isEmpty {
             sessionToken = token
             sessionExpiresAtMs = RavensightCore.resolveExpiryMs(parsed, nowMs: nowMs)
+            readErrorCapture(parsed)
             sessionWanted = false
             keyRefused = false
             lastFailure = nil
@@ -686,7 +725,9 @@ struct RavensightCore {
             if response.status == 429 { lastFailure = Reason.rateLimited }
             return [.flushFailed(response.errorCode(fallback: response.status == 429 ? "rate_limited" : "http_503"))]
 
-        case 400:
+        case 400, 413:
+            // A 413 is the same problem as a 400: split, then drop the one
+            // bad event. Never retried as is.
             if count > 1 {
                 // Oversize batch: halve and retry, down to a single event.
                 batchLimit = max(1, count / 2)
@@ -699,7 +740,7 @@ struct RavensightCore {
                 counters.dropped += 1
             }
             batchLimit = RavensightCore.maxBatchSize
-            return [.eventDropped(response.errorCode(fallback: "http_400"))]
+            return [.eventDropped(response.errorCode(fallback: "http_\(response.status)"))]
 
         default:
             scheduleBackoff(nowMs: nowMs)
@@ -721,9 +762,9 @@ struct RavensightCore {
             lastFailure = nil
             resetBackoff()
             return [.eventsFlushed(removed)]
-        case 401, 400:
+        case 401, 400, 413:
             // The old session is gone (401), or the batch needs splitting
-            // (400): either way the live queue's own handling takes over,
+            // (400, 413): either way the live queue's own handling takes over,
             // under the current session.
             demoteRestoredBatch()
             return []
