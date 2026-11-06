@@ -35,6 +35,20 @@ final class RavensightErrorTextTests: XCTestCase {
             RavensightErrorText.scrub("$s6MyGame14InventoryScreenC6reloadyyF + 52"), "$[token] + 52")
     }
 
+    func testAHugeInputIsCutBeforeTheScrubAndScrubsFast() {
+        let huge = String(repeating: "a1b2c3d4/", count: 22_223)
+        XCTAssertGreaterThanOrEqual(huge.count, 200_000)
+        let started = Date()
+        let message = RavensightErrorText.clean(huge, RavensightErrorText.maxMessage)
+        let stack = RavensightErrorText.clean(huge, RavensightErrorText.maxStack)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 1.0)
+        XCTAssertLessThanOrEqual(message.count, 200)
+        XCTAssertLessThanOrEqual(stack.count, 2000)
+        let built = RavensightErrorText.eventData(
+            RavensightCapture(source: "log", severity: "warning", message: huge, stack: huge), trail: nil)
+        XCTAssertLessThanOrEqual((built.data["rs_message"] as? String)?.count ?? 0, 200)
+    }
+
     func testSecretsInsideAnExceptionReasonAreScrubbed() {
         let reason = "upload for jane@example.com to https://cdn.example.com/a?sig=abc failed with gt_live_abcdef12"
         XCTAssertEqual(

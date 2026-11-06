@@ -105,9 +105,10 @@ enum RavensightErrorText {
         return replace(longRun, in: text) { hasDigit($0) && !isPath($0) ? "[token]" : $0 }
     }
 
-    /// Scrub, then cut to max characters.
+    /// Cut to four times max, scrub, then cut to max. The first cut keeps
+    /// the scrub's cost bounded on a huge input (some rules are quadratic).
     static func clean(_ value: String, _ max: Int) -> String {
-        return RavensightTypedEvents.cut(scrub(value), max)
+        return RavensightTypedEvents.cut(scrub(RavensightTypedEvents.cut(value, max * 4)), max)
     }
 
     private static let templateRules: [(NSRegularExpression, String)] = [
