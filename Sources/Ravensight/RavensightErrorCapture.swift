@@ -53,8 +53,10 @@ enum RavensightErrorText {
         (regex("\\beyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]*"), "[token]"),
         (regex("\\bgt_[A-Za-z0-9_]+"), "[token]"),
         (regex("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}"), "[email]"),
-        (regex("\\b[A-Za-z]:[\\\\/]Users[\\\\/][^\\\\/\\s'\"]+", .caseInsensitive), "~"),
-        (regex("/(?:Users|home)/[^/\\s'\"]+"), "~"),
+        // A home folder is the whole segment up to the next slash, quote, <,
+        // >, ':' or end of line, spaces included (contract 5).
+        (regex("\\b[A-Za-z]:[\\\\/](?:Users|Documents and Settings)[\\\\/][^/\\\\'\"<>:\\r\\n]+", .caseInsensitive), "~"),
+        (regex("/(?:Users|home)/[^/\\\\'\"<>:\\r\\n]+"), "~"),
         (regex("\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b"), "[ip]"),
         (regex("\\b(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\\b", .caseInsensitive), "[ip]"),
     ]

@@ -410,7 +410,7 @@ Before anything is saved or queued, messages, stacks and the trail are
 scrubbed on the device with the server's rules: emails become `[email]`,
 bearer tokens, JWTs, `gt_` keys and long token-like runs with a digit
 become `[token]` (a file path is kept), IP addresses become `[ip]`, home
-folders become `~`, and a URL loses its query, fragment and any user and
+folders (the whole name, spaces included) become `~`, and a URL loses its query, fragment and any user and
 password. Messages are cut to 200 characters and stacks to 2,000. The
 SDK's own requests and log lines are never captured. Swift symbol names of
 32 or more characters that contain a digit read as tokens under these rules

@@ -29,6 +29,8 @@ All notable changes to this package are documented here.
 - Device caps per session (30 captures, 3 per error, 6 a minute, 10
   trails), a boot hold of 5 until the first answer, and the server's scrub
   rules on the device, checked against the shared scrub vectors.
+- A home folder scrubs as the whole name, spaces included, and
+  `C:\Documents and Settings\<name>` is a home folder (scrub contract 5).
 - Privacy manifest: Crash Data and Other Diagnostic Data, not linked, not
   tracking, purposes Analytics and App Functionality.
 
