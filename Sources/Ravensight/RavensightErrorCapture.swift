@@ -61,8 +61,10 @@ enum RavensightErrorText {
     private static let ipv6Short = regex(
         "(?:\\b[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){0,6})?::(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){0,6}\\b)?", .caseInsensitive)
     private static let longRun = regex("[A-Za-z0-9+/=_-]{32,}")
-    private static let pathWords = [
-        regex("^$"), regex("^[a-z0-9]+([_-][a-z0-9]+)*$"),
+    /// A path word is one or more parts joined by "_" or "-", each part
+    /// lowercase, CamelCase, or an acronym of 1 to 6 capitals or digits.
+    private static let pathParts = [
+        regex("^[a-z0-9]+$"),
         regex("^[A-Z][a-z0-9]*(?:[A-Z][a-z0-9]+)*$"), regex("^[A-Z0-9]{1,6}$"),
     ]
     private static let maxPathWord = 32
@@ -79,8 +81,12 @@ enum RavensightErrorText {
     static func isPath(_ run: String) -> Bool {
         guard run.contains("/") else { return false }
         return run.split(separator: "/", omittingEmptySubsequences: false).allSatisfy { piece in
-            let word = String(piece)
-            return word.count < maxPathWord && pathWords.contains { matches($0, word) }
+            if piece.isEmpty { return true }
+            guard piece.count < maxPathWord else { return false }
+            return piece.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "_" || $0 == "-" }).allSatisfy { part in
+                let word = String(part)
+                return !word.isEmpty && pathParts.contains { matches($0, word) }
+            }
         }
     }
 
