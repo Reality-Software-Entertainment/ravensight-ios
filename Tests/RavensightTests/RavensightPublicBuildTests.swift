@@ -217,6 +217,33 @@ final class RavensightPublicBuildTests: XCTestCase {
         XCTAssertEqual(next.deviceId, id)
     }
 
+    /// The race behind the old intermittent failure, forced: a snapshot
+    /// published from the core between the yes and the core applying it
+    /// wrote "opted out" back, so a track right after the yes was refused
+    /// and the event lost.
+    func testATrackRightAfterTheYesIsKeptWhenAPublishRunsInBetween() {
+        let transport = FakeTransport()
+        let client = makeClient(transport: transport) { $0.consent = .optIn }
+        client.start()
+        settle(client)
+        let first = DispatchSemaphore(value: 0)
+        let second = DispatchSemaphore(value: 0)
+        client.workQueue.async { first.wait() }
+        client.workQueue.async { client.stateChanged() } // a publish from the old core state
+        client.workQueue.async { second.wait() }
+        client.setTrackingEnabled(true) // its core update queues behind the gates
+        first.signal()
+        // Let the publish run; the queue then waits on the second gate.
+        let published = expectation(description: "publish ran")
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { published.fulfill() }
+        wait(for: [published], timeout: 2)
+        XCTAssertFalse(client.isOptedOut, "the yes still shows")
+        XCTAssertTrue(client.track("right_after_yes"), "not refused")
+        second.signal()
+        flushAndWait(client)
+        XCTAssertEqual(sentEvents(transport).map { $0.name }, ["right_after_yes"], "and delivered, not lost")
+    }
+
     func testOptInRevokeKeepsTheDeviceIdAndResetIsSeparate() {
         let transport = FakeTransport()
         let client = makeClient(transport: transport) { $0.consent = .optIn }
@@ -343,14 +370,14 @@ final class RavensightPublicBuildTests: XCTestCase {
         return core.nextAttemptAtMs - nowMs
     }
 
-    func testBackoffJitterStaysWithinTwentyPercent() {
-        XCTAssertEqual(firstBackoffWait(random: 0), 8_000)
-        XCTAssertEqual(firstBackoffWait(random: 0.5), 10_000, "a fixed 0.5 is the old backoff exactly")
-        XCTAssertEqual(firstBackoffWait(random: 0.999_999), 12_000, accuracy: 1)
+    func testBackoffJitterIsAFactorFromHalfToOne() {
+        XCTAssertEqual(firstBackoffWait(random: 0), 5_000)
+        XCTAssertEqual(firstBackoffWait(random: 0.5), 7_500)
+        XCTAssertEqual(firstBackoffWait(random: 0.999_999), 10_000, accuracy: 1)
         for _ in 0..<200 {
             let wait = firstBackoffWait(random: Double.random(in: 0..<1))
-            XCTAssertGreaterThanOrEqual(wait, 8_000)
-            XCTAssertLessThanOrEqual(wait, 12_000)
+            XCTAssertGreaterThanOrEqual(wait, 5_000)
+            XCTAssertLessThanOrEqual(wait, 10_000)
         }
     }
 
@@ -448,7 +475,7 @@ final class RavensightPublicBuildTests: XCTestCase {
                 RavensightEvent(name: "kept", data: ["rs_event_id": "saved-id-1"], timestamp: 1),
                 RavensightEvent(name: "from_0_3", data: [:], timestamp: 2),
             ],
-            sessionToken: nil, expiresAtMs: 0, nowMs: nowMs
+            nowMs: nowMs
         )
         let ids = core.pendingEvents.compactMap { $0.data["rs_event_id"] as? String }
         XCTAssertEqual(ids.count, 2)
@@ -518,6 +545,25 @@ final class RavensightPublicBuildTests: XCTestCase {
         XCTAssertEqual(outcomes.first?.sent, 0)
         XCTAssertEqual(client.stats.droppedEvents, 1)
         XCTAssertEqual(sentEvents(transport).map { $0.name }, ["small"], "never sent")
+    }
+
+    func testTrackMeasuresAnErrorEventsTextAsTheServerDoes() {
+        // JSON writes a control character as six bytes; the server counts an
+        // error event's message, stack and trail within their caps one byte a
+        // character, so this event fits though it serializes to over 20 KB.
+        let transport = FakeTransport()
+        let client = makeClient(transport: transport)
+        client.start()
+        let control = "\u{01}"
+        XCTAssertTrue(client.track("crash_report", data: [
+            "rs_kind": "error", "rs_severity": "error",
+            "rs_message": String(repeating: control, count: 200),
+            "rs_stack": String(repeating: control, count: 2000),
+            "rs_trail": String(repeating: control, count: 1500),
+        ]))
+        XCTAssertFalse(client.track("not_an_error", data: ["rs_stack": String(repeating: control, count: 2000)]))
+        flushAndWait(client)
+        XCTAssertEqual(sentEvents(transport).map { $0.name }, ["crash_report"])
     }
 
     func testCapIsMeasuredOnTheDataWithItsId() {

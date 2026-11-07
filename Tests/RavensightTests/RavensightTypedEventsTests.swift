@@ -141,6 +141,7 @@ final class RavensightTypedEventsTests: XCTestCase {
         configuration.flushInterval = 0
         configuration.performance = performance
         configuration.enabled = enabled
+        configuration.persistQueue = false
         return Ravensight.start(configuration, makeClient: {
             let client = RavensightClient(
                 configuration: $0, transport: transport, now: { self.nowMs },
@@ -209,7 +210,7 @@ final class RavensightTypedEventsTests: XCTestCase {
         let body = transport.requests(suffix: "/session").first?.body
         let object = body.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
         XCTAssertEqual(object?["sdk"] as? String, "ios/\(Ravensight.sdkVersion)")
-        XCTAssertEqual(Ravensight.sdkVersion, "0.5.0")
+        XCTAssertEqual(Ravensight.sdkVersion, "0.6.0")
     }
 
     // MARK: Health

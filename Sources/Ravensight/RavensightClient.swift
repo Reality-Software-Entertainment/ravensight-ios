@@ -23,7 +23,7 @@ import UIKit
 /// on the main thread. That is why it is marked @unchecked.
 public final class RavensightClient: @unchecked Sendable {
     /// This SDK's version.
-    public static let sdkVersion = "0.5.0"
+    public static let sdkVersion = "0.6.0"
     /// The default host. "/api/v1" is appended for you.
     public static let defaultApiUrl = RavensightCore.defaultApiUrl
     /// Server hard limit on POST /track/batch.
@@ -153,7 +153,6 @@ public final class RavensightClient: @unchecked Sendable {
     /// client was built disabled).
     private var restoreDue = false
     private var persistedRevision = -1
-    private var persistedSessionToken: String?
     private var lastDeliveryRecord: RavensightDelivery?
 
     /// Seconds a report waits for a session to open, and between status
@@ -164,6 +163,14 @@ public final class RavensightClient: @unchecked Sendable {
 
     private let snapshotLock = NSLock()
     private var snapshot = Snapshot()
+    /// Calls to setTrackingEnabled and setEnabled whose choice the snapshot
+    /// already shows but the core, on the work queue, has not applied yet.
+    /// While any is pending, a snapshot published from the core keeps the
+    /// caller's enabled and opted out values: otherwise a publish that ran in
+    /// between (start, the queue load, a timer) wrote the core's old value
+    /// back, and a track right after the player's yes was refused and lost.
+    /// Guarded by snapshotLock.
+    private var pendingChoices = 0
     private var statusHandler: ((String?) -> Void)?
     private var flushHandler: ((RavensightFlushOutcome) -> Void)?
 
@@ -291,7 +298,9 @@ public final class RavensightClient: @unchecked Sendable {
             distribution: distribution,
             eventIds: eventIds
         )
-        var core = RavensightCore(config: coreConfig)
+        var resolvedConfig = coreConfig
+        if configuration.sendDeviceInfo { resolvedConfig.device = RavensightClient.deviceFields() }
+        var core = RavensightCore(config: resolvedConfig)
         if let random = random { core.random = random }
         // The opt-out is applied before anything can be queued or sent.
         core.setEnabled(configuration.enabled)
@@ -300,6 +309,11 @@ public final class RavensightClient: @unchecked Sendable {
             core.stop(reason: RavensightCore.Reason.noKey)
         } else if token != nil && runId == nil {
             core.stop(reason: RavensightCore.Reason.sessionFailed)
+        }
+        if let store = self.queueStore {
+            // No file contents, only that the exclusion did not take.
+            let warning: (String) -> Void = { message in print("Ravensight: \(message)") }
+            store.onExclusionFailure = warning
         }
         self.core = core
         self.snapshot.deviceId = durableId
@@ -371,14 +385,7 @@ public final class RavensightClient: @unchecked Sendable {
         let nowMs = now()
         let loaded = store.load(nowMs: nowMs)
         if loaded.dropped > 0 { core.countDropped(loaded.dropped) }
-        for group in loaded.groups {
-            core.restore(
-                events: group.events,
-                sessionToken: group.sessionToken,
-                expiresAtMs: group.expiresAtMs,
-                nowMs: nowMs
-            )
-        }
+        core.restore(events: loaded.groups.flatMap { $0.events }, nowMs: nowMs)
         if core.stats.restored > 0 {
             log("restored \(core.stats.restored) event(s) from the persisted queue")
         }
@@ -395,9 +402,11 @@ public final class RavensightClient: @unchecked Sendable {
     private func deleteQueueFile() {
         restoreDue = false
         persistScheduled = false
-        if let url = queueFileURL { try? FileManager.default.removeItem(at: url) }
+        if let url = queueFileURL {
+            try? FileManager.default.removeItem(at: url)
+            try? FileManager.default.removeItem(at: url.appendingPathExtension("tmp"))
+        }
         persistedRevision = core.queueRevision
-        persistedSessionToken = nil
     }
 
     /// Mirrors the queue to disk when it, or the session it would be sent
@@ -421,20 +430,9 @@ public final class RavensightClient: @unchecked Sendable {
     private func writeQueueNow() {
         persistScheduled = false
         guard let store = queueStore, !restoreDue else { return }
-        let valid = core.isSessionValid(nowMs: now())
-        let token = valid ? core.sessionToken : nil
-        guard core.queueRevision != persistedRevision || token != persistedSessionToken else { return }
+        guard core.queueRevision != persistedRevision else { return }
         persistedRevision = core.queueRevision
-        persistedSessionToken = token
-        var groups: [RavensightQueueStore.Group] = []
-        if let batch = core.restoredBatch {
-            groups.append(.init(sessionToken: batch.sessionToken, expiresAtMs: batch.expiresAtMs, events: batch.events))
-        }
-        groups.append(.init(
-            sessionToken: token,
-            expiresAtMs: valid ? core.sessionExpiresAtMs : 0,
-            events: core.pendingEvents
-        ))
+        let groups = RavensightQueueStore.groups(core.pendingEvents)
         queueWrites += 1
         if !store.save(groups) {
             warnOnce("queue_write", "could not write the persisted queue; events stay in memory.")
@@ -744,7 +742,7 @@ public final class RavensightClient: @unchecked Sendable {
             var payload = RavensightCore.sanitizeJSON(data ?? [:]) as? [String: Any] ?? [:]
             let id = eventIds.next()
             payload[RavensightCore.eventIdKey] = id
-            if RavensightCore.eventBytes(payload) > RavensightCore.maxEventBytes {
+            if RavensightWire.countedBytes(payload) > RavensightCore.maxEventBytes {
                 workQueue.async { self.dropTooLarge(name) }
                 return false
             }
@@ -924,6 +922,7 @@ public final class RavensightClient: @unchecked Sendable {
         var minted: String?
         snapshotLock.lock()
         snapshot.optedOut = !enabled
+        pendingChoices += 1
         if enabled && !isInert && snapshot.deviceId.isEmpty {
             let id = RavensightClient.loadOrCreateDeviceId(defaults)
             snapshot.deviceId = id
@@ -934,6 +933,7 @@ public final class RavensightClient: @unchecked Sendable {
         workQueue.async {
             if let id = minted { self.core.replaceDeviceId(id) }
             self.core.setOptedOut(!enabled)
+            self.choiceApplied()
             if !enabled { self.deleteQueueFile() }
             if enabled { self.queueGameStartedIfDue() }
             self.stateChanged()
@@ -948,9 +948,11 @@ public final class RavensightClient: @unchecked Sendable {
     public func setEnabled(_ enabled: Bool) {
         snapshotLock.lock()
         snapshot.enabled = enabled
+        pendingChoices += 1
         snapshotLock.unlock()
         workQueue.async {
             self.core.setEnabled(enabled)
+            self.choiceApplied()
             if enabled {
                 self.restoreQueueIfDue()
                 self.queueGameStartedIfDue()
@@ -1001,6 +1003,7 @@ public final class RavensightClient: @unchecked Sendable {
         if !isPlaytest && (isInert || (consent == .optIn && readSnapshot().optedOut)) {
             defaults.removeObject(forKey: RavensightClient.deviceIdKey)
             defaults.removeObject(forKey: RavensightClient.markerKey)
+            defaults.removeObject(forKey: RavensightClient.attributionKey)
             snapshotLock.lock()
             snapshot.deviceId = ""
             snapshotLock.unlock()
@@ -1018,6 +1021,7 @@ public final class RavensightClient: @unchecked Sendable {
         let fresh = RavensightClient.mintDeviceId()
         defaults.set(fresh, forKey: RavensightClient.deviceIdKey)
         defaults.removeObject(forKey: RavensightClient.markerKey)
+        defaults.removeObject(forKey: RavensightClient.attributionKey)
         snapshotLock.lock()
         snapshot.deviceId = fresh
         snapshotLock.unlock()
@@ -1321,6 +1325,7 @@ public final class RavensightClient: @unchecked Sendable {
 
         case .send(let request, let purpose):
             requestInFlight = true
+            if case .batch(let count) = purpose { core.noteInFlight(count) }
             let sent = core.stamp
             transport.send(request) { [weak self] response in
                 guard let self = self else { return }
@@ -1355,7 +1360,7 @@ public final class RavensightClient: @unchecked Sendable {
         case .session:
             guard response.status != 201, core.pendingCount > 0 else { return }
             carried = 0
-        case .batch(let count), .restored(let count):
+        case .batch(let count):
             carried = count
         case .exit:
             carried = 1
@@ -1440,10 +1445,85 @@ public final class RavensightClient: @unchecked Sendable {
     }
 
     /// Strict typed fallback. Supported defaults: Bool, Int, Double, String and JSON containers.
+    ///
+    /// Experiment exposure: the first typed read in a run (any key) marks
+    /// every experiment the last fetch assigned as exposed. One rs_exposure
+    /// event is queued then, and every event queued after it carries
+    /// rs_exp_<key> = <variant>. Events queued before carry no tag; an
+    /// experiment missing from a later fetch is no longer tagged; a
+    /// well-formed rs_exp_ value the game sets itself is kept.
     public func getConfig<T>(_ key: String, default fallback: T) -> T {
         snapshotLock.lock(); defer { snapshotLock.unlock() }
         guard snapshot.enabled, !snapshot.optedOut, snapshot.trackingEnabled, (isPlaytest || snapshot.deviceId == configSnapshotDevice), !["invalid_key", "no_key"].contains(snapshot.reason ?? "") else { return fallback }
+        workQueue.async {
+            if self.core.expose(nowMs: self.now()) { self.stateChanged() }
+        }
         return RavensightConfigDocument.get(configSnapshot[key], fallback: fallback)
+    }
+
+    // MARK: Ads and attribution
+
+    /// One ad lifecycle step as an rs_ad event (the contract's fixed name). Refused
+    /// locally, returning false with nothing queued, when the ad breaks the
+    /// contract: no network, an unknown format or result, a revenue that is
+    /// not a digit string, revenue without a three letter currency, or
+    /// revenue on a result other than shown.
+    @discardableResult
+    public func trackAd(_ ad: RavensightAd) -> Bool {
+        guard let data = ad.eventData() else {
+            warnOnce("ad_refused", "ad event refused locally: check network, format, result, and that revenue comes with a currency on a shown result.")
+            return false
+        }
+        return track("rs_ad", data: data)
+    }
+
+    /// trackAd with result shown and revenue in micros of currency.
+    @discardableResult
+    public func trackAdRevenue(network: String, format: String, placement: String?,
+                               revenueMicros: String, currency: String) -> Bool {
+        return trackAd(RavensightAd(network: network, format: format, result: "shown", placement: placement,
+                                    revenueMicros: revenueMicros, currency: currency))
+    }
+
+    /// Records where this install came from, once per install: the first
+    /// call queues one rs_attribution event and saves a flag beside the
+    /// device id; later calls, in this run or any later one, return false.
+    /// resetDeviceId forgets the flag.
+    @discardableResult
+    public func setAttribution(_ attribution: RavensightAttribution) -> Bool {
+        guard let data = attribution.eventData() else {
+            warnOnce("attribution_refused", "attribution refused locally: source must be 1 to 64 characters and fields within their limits.")
+            return false
+        }
+        guard !defaults.bool(forKey: RavensightClient.attributionKey) else { return false }
+        guard track("rs_attribution", data: data) else { return false }
+        defaults.set(true, forKey: RavensightClient.attributionKey)
+        return true
+    }
+
+    static let attributionKey = "ravensight_attribution_sent"
+
+    /// The model (utsname machine, such as iPhone15,2) and the OS version
+    /// without its name. No permission prompt, no hardware identifier.
+    static func deviceFields() -> [String: String] {
+        var system = utsname()
+        uname(&system)
+        let machine = withUnsafeBytes(of: &system.machine) { raw -> String in
+            let bytes = raw.prefix { $0 != 0 }
+            return String(decoding: bytes, as: UTF8.self)
+        }
+        let version = ProcessInfo.processInfo.operatingSystemVersion
+        var fields: [String: String] = [:]
+        let model = clean(machine)
+        if !model.isEmpty { fields["model"] = model }
+        fields["osVersion"] = clean("\(version.majorVersion).\(version.minorVersion).\(version.patchVersion)")
+        return fields
+    }
+
+    /// Printable, trimmed, at most 128 characters.
+    static func clean(_ value: String) -> String {
+        let printable = String(value.unicodeScalars.filter { $0.value >= 0x20 && $0.value != 0x7f }.map(Character.init))
+        return RavensightWire.cut(printable.trimmingCharacters(in: .whitespacesAndNewlines), 128)
     }
 
     public func fetchConfig(completion: ((RavensightConfigResult) -> Void)? = nil) {
@@ -1540,9 +1620,11 @@ public final class RavensightClient: @unchecked Sendable {
         snapshotLock.lock()
         // deviceId is the durable id, set at creation and by resetDeviceId
         // only, so it is carried over rather than read from the core.
+        // A choice the caller made that the core has not applied yet wins.
+        let callerChoicePending = pendingChoices > 0
         snapshot = Snapshot(
-            enabled: core.enabled,
-            optedOut: core.optedOut,
+            enabled: callerChoicePending ? snapshot.enabled : core.enabled,
+            optedOut: callerChoicePending ? snapshot.optedOut : core.optedOut,
             trackingEnabled: core.trackingEnabled && core.stopReason == nil,
             sessionReady: valid,
             sessionToken: valid ? core.sessionToken : nil,
@@ -1553,6 +1635,14 @@ public final class RavensightClient: @unchecked Sendable {
             capturingErrors: errorHooked,
             trailing: errorHooked && core.errorTrailEnabled
         )
+        snapshotLock.unlock()
+    }
+
+    /// Work queue only: one setTrackingEnabled or setEnabled has reached the
+    /// core, so the core is the truth again once none is pending.
+    private func choiceApplied() {
+        snapshotLock.lock()
+        pendingChoices -= 1
         snapshotLock.unlock()
     }
 

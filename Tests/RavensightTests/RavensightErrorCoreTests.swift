@@ -121,15 +121,18 @@ final class RavensightErrorCoreTests: XCTestCase {
         guard case .send = core.nextStep(nowMs: nowMs) else { return XCTFail("the rest is sent, not held back") }
     }
 
-    func testRestored413IsHandedToTheLiveQueue() {
+    func testRestored413IsHandledLikeTheLiveQueue() {
+        // Restored events join the live queue (delivery contract 3), so a 413
+        // on them splits and drops exactly as on any batch.
         var core = makeCore()
         boot(&core)
-        core.restore(
-            events: [RavensightEvent(name: "old", data: ["rs_event_id": "e1"], timestamp: 1)],
-            sessionToken: "old_sess", expiresAtMs: nowMs + 3_600_000, nowMs: nowMs)
-        XCTAssertNotNil(core.restoredBatch)
-        _ = core.handle(response: RavensightResponse(status: 413), for: .restored(count: 1), nowMs: nowMs)
-        XCTAssertNil(core.restoredBatch)
+        core.restore(events: [RavensightEvent(name: "old", data: ["rs_event_id": "e1"], timestamp: 1)], nowMs: nowMs)
         XCTAssertEqual(core.pendingEvents.map { $0.name }, ["old"])
+        openSession(&core)
+        guard case .send(_, .batch(let count)) = core.nextStep(nowMs: nowMs) else { return XCTFail("batch") }
+        XCTAssertEqual(count, 1)
+        let effects = core.handle(response: RavensightResponse(status: 413), for: .batch(count: 1), nowMs: nowMs)
+        XCTAssertEqual(effects, [.eventDropped("http_413")])
+        XCTAssertTrue(core.pendingEvents.isEmpty)
     }
 }
