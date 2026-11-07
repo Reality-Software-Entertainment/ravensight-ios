@@ -547,6 +547,25 @@ final class RavensightPublicBuildTests: XCTestCase {
         XCTAssertEqual(sentEvents(transport).map { $0.name }, ["small"], "never sent")
     }
 
+    func testTrackMeasuresAnErrorEventsTextAsTheServerDoes() {
+        // JSON writes a control character as six bytes; the server counts an
+        // error event's message, stack and trail within their caps one byte a
+        // character, so this event fits though it serializes to over 20 KB.
+        let transport = FakeTransport()
+        let client = makeClient(transport: transport)
+        client.start()
+        let control = "\u{01}"
+        XCTAssertTrue(client.track("crash_report", data: [
+            "rs_kind": "error", "rs_severity": "error",
+            "rs_message": String(repeating: control, count: 200),
+            "rs_stack": String(repeating: control, count: 2000),
+            "rs_trail": String(repeating: control, count: 1500),
+        ]))
+        XCTAssertFalse(client.track("not_an_error", data: ["rs_stack": String(repeating: control, count: 2000)]))
+        flushAndWait(client)
+        XCTAssertEqual(sentEvents(transport).map { $0.name }, ["crash_report"])
+    }
+
     func testCapIsMeasuredOnTheDataWithItsId() {
         var core = makeCore()
         // Find the largest blob that still fits once the id is added.

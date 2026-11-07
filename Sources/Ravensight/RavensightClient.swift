@@ -742,7 +742,7 @@ public final class RavensightClient: @unchecked Sendable {
             var payload = RavensightCore.sanitizeJSON(data ?? [:]) as? [String: Any] ?? [:]
             let id = eventIds.next()
             payload[RavensightCore.eventIdKey] = id
-            if RavensightCore.eventBytes(payload) > RavensightCore.maxEventBytes {
+            if RavensightWire.countedBytes(payload) > RavensightCore.maxEventBytes {
                 workQueue.async { self.dropTooLarge(name) }
                 return false
             }
