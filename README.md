@@ -10,7 +10,7 @@ dependencies.
 * API base: `https://api.ravensight.io` (the SDK appends `/api/v1`)
 * Docs: https://ravensight.io/docs/
 * Privacy: a random per-install device id, no advertising identifier, a saved player opt-out (`Ravensight.setTrackingEnabled(false)`), an opt-in mode that stores and sends nothing before the player's yes (`consent = .optIn`), a stop that covers everything (`Ravensight.stopAllTelemetry()`), a reset (`Ravensight.resetDeviceId()`), a bundled privacy manifest, no tracking permission prompt needed. What your store label can say: https://ravensight.io/docs/#privacy-label
-* iOS 15 or newer, macOS 12 or newer
+* iOS 15 or newer, macOS 12 or newer, tvOS 15 or newer (on tvOS the queue lives in Caches, the only folder a tvOS app may keep files in, so the system can purge it under storage pressure; there is no MetricKit crash report on tvOS)
 * Swift Package Manager only, URLSession transport, zero dependencies
 
 ## Verification status

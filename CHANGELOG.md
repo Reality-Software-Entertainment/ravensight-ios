@@ -7,6 +7,9 @@ device field contracts.
 
 ### Added
 
+- tvOS 15 or newer in `Package.swift`. The whole test suite passes on a
+  tvOS simulator. On tvOS the saved queue and pending crash records live in
+  Caches, the only folder a tvOS app may keep files in.
 - Queue format version 2: each group carries its session's `origin` as the
   session answer gave it; events tracked under an earlier session are sent
   under the current one with that origin. Version 1 files are still read.

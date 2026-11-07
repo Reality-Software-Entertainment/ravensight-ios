@@ -115,6 +115,19 @@ final class RavensightWaveTests: XCTestCase {
 
     // MARK: Queue file
 
+    func testDefaultQueueFolderIsApplicationSupportOrCachesOnTvOS() throws {
+        let url = try XCTUnwrap(RavensightQueueStore.defaultFileURL(ingestKey: "gt_pub_test"))
+        let folder = url.deletingLastPathComponent()
+        XCTAssertEqual(folder.lastPathComponent, "Ravensight")
+        #if os(tvOS)
+        XCTAssertEqual(RavensightQueueStore.defaultSearchPath, .cachesDirectory, "tvOS apps may keep files only in Caches")
+        XCTAssertTrue(folder.path.contains("/Caches/"), folder.path)
+        #else
+        XCTAssertEqual(RavensightQueueStore.defaultSearchPath, .applicationSupportDirectory)
+        XCTAssertTrue(folder.path.contains("/Application Support/"), folder.path)
+        #endif
+    }
+
     func testQueueFileVersion2KeepsOriginsAndNoTokens() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("rs-wave-\(UUID())")
         defer { try? FileManager.default.removeItem(at: dir) }

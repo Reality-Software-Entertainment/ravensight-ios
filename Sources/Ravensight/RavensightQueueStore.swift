@@ -82,14 +82,23 @@ final class RavensightQueueStore {
         return false
     }
 
-    /// Application Support/Ravensight/queue-<key hash>.json. The key hash
-    /// keeps two clients with different ingest keys apart.
+    /// Where the queue folder lives: Application Support, except on tvOS,
+    /// where an app may keep files only in Caches (which the system can
+    /// purge under storage pressure; the queue is then simply empty).
+    #if os(tvOS)
+    static let defaultSearchPath: FileManager.SearchPathDirectory = .cachesDirectory
+    #else
+    static let defaultSearchPath: FileManager.SearchPathDirectory = .applicationSupportDirectory
+    #endif
+
+    /// Application Support/Ravensight/queue-<key hash>.json (Caches on
+    /// tvOS). The key hash keeps two clients with different ingest keys apart.
     static func defaultFileURL(ingestKey: String, directory: URL? = nil) -> URL? {
         let base: URL
         if let directory = directory {
             base = directory
         } else {
-            guard let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            guard let support = FileManager.default.urls(for: defaultSearchPath, in: .userDomainMask).first else {
                 return nil
             }
             base = support.appendingPathComponent("Ravensight", isDirectory: true)
@@ -226,7 +235,7 @@ final class RavensightQueueStore {
         if let directory = directory {
             base = directory
         } else {
-            guard let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return }
+            guard let support = FileManager.default.urls(for: defaultSearchPath, in: .userDomainMask).first else { return }
             base = support.appendingPathComponent("Ravensight", isDirectory: true)
         }
         let files = (try? FileManager.default.contentsOfDirectory(at: base, includingPropertiesForKeys: nil)) ?? []
