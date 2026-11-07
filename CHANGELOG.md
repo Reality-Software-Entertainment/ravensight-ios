@@ -1,9 +1,11 @@
 # Changelog
 
-## Unreleased
+## [0.6.0] - 2026-11-06
 
 Implements the Ravensight delivery, ads and attribution, exposure and
-device field contracts.
+device field contracts. Needs a Ravensight server that accepts origins, signatures, gzip bodies,
+`rs_exposure` and the `rs_ad_*` and `rs_attr_*` keys; the hosted service at
+ravensight.io runs one.
 
 ### Added
 
@@ -57,7 +59,8 @@ device field contracts.
 - Backoff jitter is a factor in [0.5, 1) (was plus or minus 20 percent);
   `flush()` no longer cuts a `Retry-After` wait short.
 - The 8 KB event check counts an error event's message, stack and trail
-  one byte a character, as the server does.
+  one byte a character, as the server does, in `track()` as well as in the
+  queue (`track()` measured the raw JSON and could drop such an event).
 
 ## 0.4.1 (held)
 
