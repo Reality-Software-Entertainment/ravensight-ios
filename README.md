@@ -30,7 +30,7 @@ What has been run, and what has not:
   tests), and its tests under `xcodebuild test` on the same iOS Simulator.
   The SwiftUI executable has been built on macOS, not launched against a
   live server. The queries in its `QUERIES.md` were run against a local
-  ClickHouse with the events table's schema and a small hand made dataset,
+  copy of the events table's schema and a small hand made dataset,
   not against production data.
 * Player Reports were tested against a stub transport that answers the way
   the server's report routes do (`src/routes/v1/playerReports.js`). A
