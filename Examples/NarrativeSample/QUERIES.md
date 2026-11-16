@@ -5,7 +5,7 @@ tool and the MCP server. Both scope every query to your game and leave out
 synthetic (playtest) sessions by default, so the queries below do not filter
 on `game_id` or `synthetic` themselves.
 
-Event data is in `props`, a `Map(String, String)` of the top level keys each
+Event data is in `props`, a map of text keys to text values: the top level keys each
 event sent. Numbers arrive as text, so read them with `toFloat64OrZero` or
 `toUInt32OrZero`. `game_version` is a column: the SDK sends the app's
 version when it opens a session.
@@ -26,7 +26,7 @@ Every event carries `foreground_seconds_total` and
 `idle_seconds_estimate_total`: running totals for the run, across every
 launch that resumed it.
 
-Every query here was run against a local ClickHouse with the same events
+Every query here was run against a local copy of the same events
 schema and a small hand made dataset (two runs, a reroll, two versions),
 and returned the expected rows. They have not been run against production
 data.
