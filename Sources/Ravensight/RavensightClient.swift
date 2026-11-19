@@ -1089,7 +1089,11 @@ public final class RavensightClient: @unchecked Sendable {
     /// sign-in. Call it after the player signs in, and again on later
     /// launches if you like (the same account is a no-op). Only a salted
     /// hash of the id is sent, once per session; the id itself is never
-    /// sent or saved. Pass an opaque internal id, never an email or a name.
+    /// sent or saved. Pass a random, high-entropy id (a random UUID or
+    /// analytics id stored with the account), never a sequential database
+    /// key, an email or a name: the salt reaches every client, so a guessable
+    /// id can be matched. The hash is a pseudonymous identifier to declare in
+    /// the game's privacy notice.
     ///
     /// Returns false, with one warning line, when the id is refused: empty
     /// ("empty"), more than 256 UTF-8 bytes ("too_long") or containing "@"

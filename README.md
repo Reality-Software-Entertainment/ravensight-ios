@@ -313,16 +313,22 @@ If your game has its own sign-in, tell Ravensight who signed in so one person
 on two devices, or before and after sign-in, counts as one player:
 
 ```swift
-Ravensight.identify(account.id)   // after your sign-in succeeds
-Ravensight.resetIdentity()        // on sign-out
+Ravensight.identify(account.analyticsId)   // after your sign-in succeeds: a random id stored with the account
+Ravensight.resetIdentity()                 // on sign-out
 ```
 
 - **What is sent.** Only a hash of the id, keyed with a salt that belongs to
   your game, and the session token, once per session. The raw id and any
   email are never sent and never saved. The same account in two games gives
   two unrelated ids.
-- **Pass an opaque id**, such as your database key or a UUID, never an
-  email, a name or a platform handle. `identify` returns false, prints one
+- **Pass a random, high-entropy id**, such as a random UUID
+  (`UUID().uuidString`) or a random analytics id you make once for each
+  account and store with it, never a sequential database key, an email, a
+  name or a platform handle. Your game's salt reaches every copy of the game,
+  so anyone could hash 1, 2, 3 and onward and match a guessable id; a random
+  one cannot be guessed. The hash is still a pseudonymous identifier for the
+  player: declare it in your game's privacy notice and your App Store privacy
+  answers. `identify` returns false, prints one
   line and does nothing for an id that is empty, longer than 256 UTF-8 bytes
   or contains `@`. The id is used exactly as given, never trimmed.
 - **It lasts.** The hash is saved beside the device id (`UserDefaults` key
