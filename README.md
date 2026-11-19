@@ -68,7 +68,7 @@ Or add it to your `Package.swift` yourself:
 dependencies: [
     .package(
         url: "https://github.com/Reality-Software-Entertainment/ravensight-ios.git",
-        from: "0.6.0"
+        from: "0.7.0"
     ),
 ],
 targets: [
@@ -137,6 +137,7 @@ Everything game code needs is static on `Ravensight`:
 | `Ravensight.setTrackingEnabled(_:)` | The player's lasting choice. Saved, works before `start`. Does not stop a synthetic session. |
 | `Ravensight.stopAllTelemetry()` / `resumeTelemetry()` | Stops everything now, synthetic sessions included, and saves nothing. |
 | `Ravensight.resetDeviceId()` | Saves a new durable identity and returns it. Never returns a synthetic id. |
+| `Ravensight.identify(_:)` / `resetIdentity()` / `isIdentified` | Links this device to your game's own account after sign-in, and forgets it on sign-out. See "Identify players who sign in". |
 | `Ravensight.deviceId` | The durable device id, safe to mirror. Never a synthetic id. |
 | `Ravensight.playtestDeviceId` / `isSynthetic` | The id a synthetic (playtest) run sends, and whether this run is one. |
 | `Ravensight.stats` | `queued`, `delivered`, `pending`, `droppedEvents`, `restored`, `lastDelivery`. |
@@ -304,6 +305,42 @@ In a normal session `setAnalytics(false)` saves the opt-out and stops; the
 next launch makes no request at all. In a synthetic session the saved
 opt-out is ignored, but `stopAllTelemetry()` stops the run, so the switch
 still means "nothing more is sent".
+
+## Identify players who sign in
+
+If your game has its own sign-in, tell Ravensight who signed in so one person
+on two devices, or before and after sign-in, counts as one player:
+
+```swift
+Ravensight.identify(account.id)   // after your sign-in succeeds
+Ravensight.resetIdentity()        // on sign-out
+```
+
+- **What is sent.** Only a hash of the id, keyed with a salt that belongs to
+  your game, and the session token, once per session. The raw id and any
+  email are never sent and never saved. The same account in two games gives
+  two unrelated ids.
+- **Pass an opaque id**, such as your database key or a UUID, never an
+  email, a name or a platform handle. `identify` returns false, prints one
+  line and does nothing for an id that is empty, longer than 256 UTF-8 bytes
+  or contains `@`. The id is used exactly as given, never trimmed.
+- **It lasts.** The hash is saved beside the device id (`UserDefaults` key
+  `ravensight_identity`) and each later session is identified with no call.
+  Calling `identify` again with the same account does nothing.
+- **Sign-out.** `resetIdentity()` forgets the saved identity and switches to
+  a fresh device id, like `resetDeviceId()`, so the next player on this
+  device is not counted as the last one. Identifying a different account
+  does this first on its own. `resetDeviceId()` alone keeps the identity.
+- **Consent.** Without a key, or with `consent = .optIn` before the
+  player's yes, the id is held in memory only and nothing is sent.
+  `setTrackingEnabled(false)` forgets the identity.
+- **Usage.** Each identified session is one event on your usage. Identify
+  never enters the event queue and never delays your events. A synthetic
+  (playtest) run never identifies.
+
+Your privacy form: a game that calls `identify` links Ravensight data to the
+player's account, so declare the data types as linked to the player (and a
+User ID) in your own manifest.
 
 ## Telling players
 
@@ -979,7 +1016,8 @@ app's privacy report. It declares:
 * `NSPrivacyTracking`: false, with no tracking domains.
 * `NSPrivacyAccessedAPITypes`: `NSPrivacyAccessedAPICategoryUserDefaults`
   with reason `CA92.1`. The SDK reads and writes its own keys (device id,
-  opt-out, opt-in, background marker, the crash reports already sent) and
+  opt-out, opt-in, background marker, the crash reports already sent, the
+  identify hash) and
   nothing else. The persisted queue file is
   written and read without any API that needs a declared reason.
 * `NSPrivacyCollectedDataTypes`: Device ID and Product Interaction, each not
