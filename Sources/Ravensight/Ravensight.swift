@@ -14,15 +14,19 @@ import UIKit
 /// queue. See RavensightClient for the full concurrency contract.
 public enum Ravensight {
     private static let lock = NSLock()
-    // Both are only touched while holding lock.
+    // All three are only touched while holding lock.
     #if compiler(>=5.10)
     nonisolated(unsafe) private static var _shared: RavensightClient?
     /// A runtime setEnabled made before start, for this process only.
     nonisolated(unsafe) private static var pendingEnabled: Bool?
+    /// A campaign link set before start, memory only, handed to the client.
+    nonisolated(unsafe) private static var pendingCampaignLink: String?
     #else
     private static var _shared: RavensightClient?
     /// A runtime setEnabled made before start, for this process only.
     private static var pendingEnabled: Bool?
+    /// A campaign link set before start, memory only, handed to the client.
+    private static var pendingCampaignLink: String?
     #endif
 
     /// The shared client, or nil before start() has been called.
@@ -59,7 +63,10 @@ public enum Ravensight {
         pendingEnabled = nil
         let client = makeClient(configuration)
         _shared = client
+        let link = pendingCampaignLink
+        pendingCampaignLink = nil
         lock.unlock()
+        if let link = link { client.setCampaignLink(link) }
         client.start()
         return client
     }
@@ -69,6 +76,7 @@ public enum Ravensight {
         lock.lock()
         _shared = nil
         pendingEnabled = nil
+        pendingCampaignLink = nil
         lock.unlock()
     }
 
@@ -310,6 +318,25 @@ public enum Ravensight {
     /// True while an identity is stored or held. False before start().
     public static var isIdentified: Bool {
         return shared?.isIdentified ?? false
+    }
+
+    /// Passes the rs_link value of the universal link, deep link or install
+    /// referrer that brought this player, so the next session counts on the
+    /// Campaign links page. Returns false for anything but a link id (24 hex
+    /// characters). Safe before start(): the id is held in memory for this
+    /// process and goes with the first session. Never saved. See
+    /// RavensightClient.setCampaignLink(_:).
+    @discardableResult
+    public static func setCampaignLink(_ id: String?) -> Bool {
+        guard let link = RavensightCore.validCampaignLink(id) else { return false }
+        lock.lock()
+        guard let client = _shared else {
+            pendingCampaignLink = link
+            lock.unlock()
+            return true
+        }
+        lock.unlock()
+        return client.setCampaignLink(link)
     }
 
     /// Stops everything now, normal and synthetic (playtest) sessions alike:

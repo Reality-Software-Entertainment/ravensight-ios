@@ -1291,6 +1291,34 @@ public final class RavensightClient: @unchecked Sendable {
         }
     }
 
+    // MARK: Campaign link
+
+    /// The Ravensight campaign link this player arrived by. A campaign link
+    /// adds rs_link=<link id> to the address it redirects to, so pass the
+    /// rs_link value from the universal link, deep link or install referrer
+    /// your app already handles. The id goes once, as campaignLink, with the
+    /// next session this client opens for its own player (best before the
+    /// first one), and is dropped when that session opens; a failed open
+    /// keeps it for the next attempt. Later sessions carry none unless it is
+    /// set again. It is held in memory only, never saved, and follows the
+    /// same key and consent rules as everything else. A playtest run never
+    /// sends it.
+    ///
+    /// Returns true when the id is a link id (24 hex characters, any case)
+    /// and now waits, replacing any earlier one. Anything else returns false
+    /// and leaves a waiting link as it was.
+    @discardableResult
+    public func setCampaignLink(_ id: String?) -> Bool {
+        guard let link = RavensightCore.validCampaignLink(id) else { return false }
+        workQueue.async { self.core.setCampaignLink(link) }
+        return true
+    }
+
+    /// The campaign link waiting for a session, or nil. Tests.
+    var campaignLinkPending: String? {
+        return workQueue.sync { core.campaignLink }
+    }
+
     /// The durable per install id (dev_ plus 32 hex), saved in UserDefaults.
     /// Safe to mirror in your own storage: it is never a synthetic id. In a
     /// synthetic (playtest) session it still returns the durable id, or an
@@ -1576,6 +1604,7 @@ public final class RavensightClient: @unchecked Sendable {
         case .send(let request, let purpose):
             requestInFlight = true
             if case .batch(let count) = purpose { core.noteInFlight(count) }
+            if case .session = purpose { core.noteSessionInFlight() }
             let sent = core.stamp
             transport.send(request) { [weak self] response in
                 guard let self = self else { return }
@@ -1584,6 +1613,8 @@ public final class RavensightClient: @unchecked Sendable {
                     if self.core.isStale(purpose, since: sent) {
                         // Opt-out, disable or resetDeviceId happened while
                         // this was in flight: it belongs to the old state.
+                        // A session it opened still used up the campaign link.
+                        if case .session = purpose { self.core.settleCampaignLink(response) }
                         self.log("ignored a response that no longer applies")
                         self.pump()
                         return
