@@ -647,6 +647,10 @@ final class RavensightIdentifyTests: XCTestCase {
         XCTAssertEqual(identifies(transport).count, 2)
         nextSession() // two in a row: stopped
         XCTAssertEqual(identifies(transport).count, 2)
+        client.resetIdentity() // a sign-out starts over
+        client.identify("u9")
+        settle(client)
+        XCTAssertEqual(identifies(transport).count, 3)
 
         let other = saltedTransport(prefix: "t")
         other.identifyStatus = 400
