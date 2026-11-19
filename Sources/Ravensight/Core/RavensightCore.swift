@@ -246,6 +246,9 @@ struct RavensightCore {
     /// Queued events carried by the batch request in flight (noteInFlight).
     private(set) var inFlightCount = 0
     private(set) var sessionToken: String?
+    /// The identify salt the last session answer carried (identify.salt),
+    /// nil when it carried none.
+    private(set) var identifySalt: String?
     /// Unix milliseconds.
     private(set) var sessionExpiresAtMs: Int64 = 0
     /// Set when something other than the queue needs a session (feedback).
@@ -722,6 +725,7 @@ struct RavensightCore {
             sessionToken = token
             sessionExpiresAtMs = RavensightCore.resolveExpiryMs(parsed, nowMs: nowMs)
             readErrorCapture(parsed)
+            identifySalt = RavensightIdentity.salt(in: parsed)
             // The origin, kept exactly as received: events tracked under this
             // session carry it, so a later launch sends them as this session's.
             sessionOrigin = parsed?["origin"] as? [String: Any]
@@ -1042,6 +1046,20 @@ struct RavensightCore {
             url: config.apiUrl + "/reports" + path,
             headers: withPlaytest(headers),
             body: body.map { RavensightCore.encodeJSON($0) }
+        )
+    }
+
+    /// POST /identify: the key, the session token and only the hash.
+    func identifyRequest(accountHash: String, token: String) -> RavensightRequest {
+        return RavensightRequest(
+            method: "POST",
+            url: config.apiUrl + "/identify",
+            headers: withPlaytest([
+                "Content-Type": "application/json",
+                "X-API-Key": config.ingestKey,
+                "X-Session-Token": token,
+            ]),
+            body: RavensightCore.encodeJSON(["accountHash": accountHash])
         )
     }
 

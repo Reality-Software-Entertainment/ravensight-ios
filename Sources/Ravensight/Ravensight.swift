@@ -275,6 +275,43 @@ public enum Ravensight {
         return fresh
     }
 
+    /// Links this device to the game's own account after the player signs
+    /// in. Only a salted hash of the id is sent, once per session; the id is
+    /// never sent or saved. Returns false, with one warning line, for an id
+    /// that is empty, over 256 UTF-8 bytes or contains "@", and before
+    /// start(). See RavensightClient.identify(_:).
+    @discardableResult
+    public static func identify(_ accountId: String) -> Bool {
+        guard let client = shared else {
+            if let reason = RavensightIdentity.refusal(accountId) {
+                RavensightClient.warnIdentifyRefused(reason)
+            } else {
+                print("Ravensight: identify needs Ravensight.start first; nothing was kept.")
+            }
+            return false
+        }
+        return client.identify(accountId)
+    }
+
+    /// For sign-out: forgets the stored identity and switches to a fresh
+    /// device id, as resetDeviceId() does. Does nothing when no identity is
+    /// stored. Before start() it forgets a saved identity for the client to
+    /// find gone.
+    public static func resetIdentity() {
+        if let client = shared {
+            client.resetIdentity()
+            return
+        }
+        guard UserDefaults.standard.object(forKey: RavensightClient.identityKey) != nil else { return }
+        UserDefaults.standard.removeObject(forKey: RavensightClient.identityKey)
+        resetDeviceId()
+    }
+
+    /// True while an identity is stored or held. False before start().
+    public static var isIdentified: Bool {
+        return shared?.isIdentified ?? false
+    }
+
     /// Stops everything now, normal and synthetic (playtest) sessions alike:
     /// timer stopped, queue cleared, track, feedback and reports refused,
     /// nothing saved. See RavensightClient.stopAllTelemetry. Before start()

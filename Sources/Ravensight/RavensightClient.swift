@@ -38,6 +38,8 @@ public final class RavensightClient: @unchecked Sendable {
     static let optInKey = "ravensight_optin"
     /// Crash diagnostics already handled, so each is sent once.
     static let crashSeenKey = "ravensight_crash_seen"
+    /// The stored identity: { salt, accountHash }, never the account id.
+    static let identityKey = "ravensight_identity"
     /// When the last few Objective-C exception crashes happened, so the
     /// system's report of the same crash is not sent a second time.
     static let exceptionTimesKey = "ravensight_exception_times"
@@ -160,6 +162,28 @@ public final class RavensightClient: @unchecked Sendable {
     var reportSessionWait: TimeInterval = 10
     var reportPollInterval: TimeInterval = 2
     var reportPollAttempts = 35
+
+    // Identify. Guarded by identityLock, read from any thread.
+    private let identityLock = NSLock()
+    /// A valid account id waiting for a salt or for consent, memory only.
+    private var heldAccountId: String?
+    /// The stored identity, mirrored from identityKey.
+    private var identity: StoredIdentity?
+    /// The salt this launch's session answer carried.
+    private var launchSalt: String?
+    /// A session answer carried no salt: identify is unavailable this launch.
+    private var identifySaltMissing = false
+    /// A 404 or an invalid hash answer: nothing more is sent this launch.
+    private var identifyStopped = false
+    /// The session token identify was last sent under (any answer).
+    private var identifiedSession: String?
+    /// Bumped by resetIdentity and opt-out: an answer from before is stale.
+    private var identityGeneration = 0
+
+    struct StoredIdentity: Equatable {
+        var salt: String
+        var accountHash: String
+    }
 
     private let snapshotLock = NSLock()
     private var snapshot = Snapshot()
@@ -316,6 +340,11 @@ public final class RavensightClient: @unchecked Sendable {
             store.onExclusionFailure = warning
         }
         self.core = core
+        if !inert && token == nil,
+           let saved = defaults.dictionary(forKey: RavensightClient.identityKey),
+           let salt = saved["salt"] as? String, let hash = saved["accountHash"] as? String {
+            self.identity = StoredIdentity(salt: salt, accountHash: hash)
+        }
         self.snapshot.deviceId = durableId
         self.persistedRevision = self.core.queueRevision
         self.lastNotifiedReason = self.core.statusReason
@@ -477,6 +506,7 @@ public final class RavensightClient: @unchecked Sendable {
         queueGameStartedIfDue()
         stateChanged()
         pump()
+        identifyIfDue(wantSession: true)
     }
 
     /// Main thread only. A scene based app can report the background state
@@ -918,6 +948,8 @@ public final class RavensightClient: @unchecked Sendable {
             return
         }
         RavensightClient.saveTrackingEnabled(enabled, defaults: defaults, consent: consent)
+        // Opting out (or withdrawing consent) forgets the identity.
+        if !enabled { forgetIdentity() }
         // The first yes in opt-in mode is the first moment an id may exist.
         var minted: String?
         snapshotLock.lock()
@@ -937,7 +969,10 @@ public final class RavensightClient: @unchecked Sendable {
             if !enabled { self.deleteQueueFile() }
             if enabled { self.queueGameStartedIfDue() }
             self.stateChanged()
-            if enabled { self.pump() }
+            if enabled {
+                self.pump()
+                self.identifyIfDue(wantSession: true)
+            }
         }
     }
 
@@ -962,7 +997,10 @@ public final class RavensightClient: @unchecked Sendable {
                 self.deleteQueueFile()
             }
             self.stateChanged()
-            if enabled { self.pump() }
+            if enabled {
+                self.pump()
+                self.identifyIfDue(wantSession: false)
+            }
         }
     }
 
@@ -1039,6 +1077,189 @@ public final class RavensightClient: @unchecked Sendable {
             self.stateChanged()
         }
         return fresh
+    }
+
+    // MARK: Identify
+
+    /// Links this device to the game's own account, for a game with its own
+    /// sign-in. Call it after the player signs in, and again on later
+    /// launches if you like (the same account is a no-op). Only a salted
+    /// hash of the id is sent, once per session; the id itself is never
+    /// sent or saved. Pass an opaque internal id, never an email or a name.
+    ///
+    /// Returns false, with one warning line, when the id is refused: empty
+    /// ("empty"), more than 256 UTF-8 bytes ("too_long") or containing "@"
+    /// ("looks_like_email"). A refusal sends nothing and changes nothing.
+    /// A different account than the stored one runs resetIdentity() first.
+    /// Without a key, or with consent = .optIn before the player's yes, the
+    /// id is held in memory only until it may be used.
+    @discardableResult
+    public func identify(_ accountId: String) -> Bool {
+        if let reason = RavensightIdentity.refusal(accountId) {
+            RavensightClient.warnIdentifyRefused(reason)
+            return false
+        }
+        // A synthetic (playtest) run never stores or sends an identity.
+        if isPlaytest { return true }
+
+        identityLock.lock()
+        let same = heldAccountId == accountId || identity.map {
+            RavensightIdentity.accountHash(accountId: accountId, salt: $0.salt) == $0.accountHash
+        } ?? false
+        let other = !same && (heldAccountId != nil || identity != nil)
+        identityLock.unlock()
+        if same { return true }
+        if other { resetIdentity() }
+
+        identityLock.lock()
+        if identifySaltMissing {
+            identityLock.unlock()
+            log("identify is not offered by this server; nothing is kept this launch")
+            return true
+        }
+        if !isInert, !readSnapshot().optedOut, let salt = launchSalt {
+            storeIdentity(StoredIdentity(
+                salt: salt,
+                accountHash: RavensightIdentity.accountHash(accountId: accountId, salt: salt)
+            ))
+        } else {
+            heldAccountId = accountId
+        }
+        identityLock.unlock()
+        if !isInert { workQueue.async { self.identifyIfDue(wantSession: true) } }
+        return true
+    }
+
+    /// For sign-out: forgets the stored identity (and any id held in
+    /// memory) and switches to a fresh device id exactly as resetDeviceId()
+    /// does, so the next session is not linked to the account. With nothing
+    /// stored or held it does nothing. Nothing is sent.
+    public func resetIdentity() {
+        guard forgetIdentity() else { return }
+        resetDeviceId()
+    }
+
+    /// True while an identity is stored, or a valid id is held in memory.
+    public var isIdentified: Bool {
+        identityLock.lock()
+        defer { identityLock.unlock() }
+        return identity != nil || heldAccountId != nil
+    }
+
+    /// True while a valid id waits in memory (for a salt or consent). Tests.
+    var identityHeld: Bool {
+        identityLock.lock()
+        defer { identityLock.unlock() }
+        return heldAccountId != nil
+    }
+
+    static func warnIdentifyRefused(_ reason: String) {
+        print("Ravensight: identify refused (\(reason)): pass an opaque account id, 1 to 256 bytes, with no @. Nothing was sent or changed.")
+    }
+
+    /// Drops the stored identity and any held id. Returns whether there was
+    /// one. Any thread.
+    @discardableResult
+    private func forgetIdentity() -> Bool {
+        identityLock.lock()
+        let had = identity != nil || heldAccountId != nil
+        identity = nil
+        heldAccountId = nil
+        identifiedSession = nil
+        identityGeneration += 1
+        identityLock.unlock()
+        if !isInert { defaults.removeObject(forKey: RavensightClient.identityKey) }
+        return had
+    }
+
+    /// Saves the identity. identityLock held.
+    private func storeIdentity(_ stored: StoredIdentity) {
+        identity = stored
+        defaults.set(["salt": stored.salt, "accountHash": stored.accountHash], forKey: RavensightClient.identityKey)
+    }
+
+    /// A session answer arrived (work queue): learn the salt, drop what it
+    /// rules out, then identify this session if due.
+    private func sessionAnswered(salt: String?) {
+        identityLock.lock()
+        guard let salt = salt else {
+            identifySaltMissing = true
+            launchSalt = nil
+            heldAccountId = nil
+            identityLock.unlock()
+            return
+        }
+        launchSalt = salt
+        if let stored = identity, stored.salt != salt {
+            // Made under another game's salt: deleted, never sent.
+            identity = nil
+            defaults.removeObject(forKey: RavensightClient.identityKey)
+        }
+        identityLock.unlock()
+        identifyIfDue(wantSession: false)
+    }
+
+    /// Hashes a held id once it may be, and sends the identity once for the
+    /// current session. Never touches the event queue. Work queue only.
+    private func identifyIfDue(wantSession: Bool) {
+        guard started, !isInert, !isPlaytest, core.isActive, !readSnapshot().optedOut else { return }
+        identityLock.lock()
+        if identifySaltMissing { heldAccountId = nil }
+        if let raw = heldAccountId, let salt = launchSalt {
+            storeIdentity(StoredIdentity(salt: salt, accountHash: RavensightIdentity.accountHash(accountId: raw, salt: salt)))
+            heldAccountId = nil
+        }
+        guard !identifyStopped, !identifySaltMissing, identity != nil || heldAccountId != nil else {
+            identityLock.unlock()
+            return
+        }
+        guard core.isSessionValid(nowMs: now()), let token = core.sessionToken,
+              let current = identity, launchSalt != nil else {
+            identityLock.unlock()
+            if wantSession {
+                core.markSessionWanted()
+                pump()
+            }
+            return
+        }
+        guard identifiedSession != token else {
+            identityLock.unlock()
+            return
+        }
+        // Remembered before the answer: whatever it says, not again this session.
+        identifiedSession = token
+        let generation = identityGeneration
+        identityLock.unlock()
+        let request = core.identifyRequest(accountHash: current.accountHash, token: token)
+        transport.send(request) { [weak self] response in
+            guard let self = self else { return }
+            self.workQueue.async { self.identifyAnswered(response, generation: generation) }
+        }
+    }
+
+    private func identifyAnswered(_ response: RavensightResponse, generation: Int) {
+        identityLock.lock()
+        guard generation == identityGeneration else {
+            identityLock.unlock()
+            log("ignored an identify answer that no longer applies")
+            return
+        }
+        let error = response.errorCode(fallback: fallbackCode(response.status))
+        let outcome = RavensightIdentity.outcome(status: response.status, error: error)
+        if outcome == .stopForLaunch { identifyStopped = true }
+        identityLock.unlock()
+        switch outcome {
+        case .done:
+            log("identified this session")
+        case .nextSession:
+            log("identify not accepted (\(error)), will try again next session")
+        case .stopForLaunch:
+            if error == "invalid_account_hash" {
+                warnOnce("identify_invalid", "identify was refused as invalid_account_hash; not sent again this launch.")
+            } else {
+                log("identify is not offered by this server (\(error)); not sent again this launch")
+            }
+        }
     }
 
     /// The durable per install id (dev_ plus 32 hex), saved in UserDefaults.
@@ -1424,6 +1645,7 @@ public final class RavensightClient: @unchecked Sendable {
                 }
             case .sessionReady:
                 log("session ready")
+                sessionAnswered(salt: core.identifySalt)
                 fetchConfigOnQueue(nil)
                 if backgroundedAtMs != nil { writeBackgroundMarker() }
             case .sessionFailed(let reason):
