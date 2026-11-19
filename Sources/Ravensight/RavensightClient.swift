@@ -177,6 +177,8 @@ public final class RavensightClient: @unchecked Sendable {
     private var identifyStopped = false
     /// The session token identify was last sent under (any answer).
     private var identifiedSession: String?
+    /// no_session answers in a row: a second one ends identify for the launch.
+    private var noSessionStreak = 0
     /// Bumped by resetIdentity and opt-out: an answer from before is stale.
     private var identityGeneration = 0
 
@@ -1103,12 +1105,17 @@ public final class RavensightClient: @unchecked Sendable {
         if isPlaytest { return true }
 
         identityLock.lock()
-        let same = heldAccountId == accountId || identity.map {
+        let sameHeld = heldAccountId == accountId
+        let sameStored = identity.map {
             RavensightIdentity.accountHash(accountId: accountId, salt: $0.salt) == $0.accountHash
         } ?? false
-        let other = !same && (heldAccountId != nil || identity != nil)
+        let saltKnown = launchSalt != nil
+        let other = !sameHeld && !sameStored && (heldAccountId != nil || identity != nil)
         identityLock.unlock()
-        if same { return true }
+        if sameHeld { return true }
+        // Before this launch's salt is known the id is held even when it
+        // matches the stored identity: the salt that arrives may differ.
+        if sameStored && saltKnown { return true }
         if other { resetIdentity() }
 
         identityLock.lock()
@@ -1163,12 +1170,16 @@ public final class RavensightClient: @unchecked Sendable {
     private func forgetIdentity() -> Bool {
         identityLock.lock()
         let had = identity != nil || heldAccountId != nil
+            || defaults.object(forKey: RavensightClient.identityKey) != nil
         identity = nil
         heldAccountId = nil
         identifiedSession = nil
+        noSessionStreak = 0
         identityGeneration += 1
         identityLock.unlock()
-        if !isInert { defaults.removeObject(forKey: RavensightClient.identityKey) }
+        // Deleted even while inert: an identity an earlier keyed build saved
+        // must not outlive the player's no.
+        defaults.removeObject(forKey: RavensightClient.identityKey)
         return had
     }
 
@@ -1196,12 +1207,13 @@ public final class RavensightClient: @unchecked Sendable {
             defaults.removeObject(forKey: RavensightClient.identityKey)
         }
         identityLock.unlock()
-        identifyIfDue(wantSession: false)
+        // The token this answer just returned, whatever the device clock says.
+        identifyIfDue(wantSession: false, freshToken: core.sessionToken)
     }
 
     /// Hashes a held id once it may be, and sends the identity once for the
     /// current session. Never touches the event queue. Work queue only.
-    private func identifyIfDue(wantSession: Bool) {
+    private func identifyIfDue(wantSession: Bool, freshToken: String? = nil) {
         guard started, !isInert, !isPlaytest, core.isActive, !readSnapshot().optedOut else { return }
         identityLock.lock()
         if identifySaltMissing { heldAccountId = nil }
@@ -1213,10 +1225,12 @@ public final class RavensightClient: @unchecked Sendable {
             identityLock.unlock()
             return
         }
-        guard core.isSessionValid(nowMs: now()), let token = core.sessionToken,
-              let current = identity, launchSalt != nil else {
+        let token = freshToken ?? (core.isSessionValid(nowMs: now()) ? core.sessionToken : nil)
+        guard let token = token, let current = identity, launchSalt != nil else {
             identityLock.unlock()
-            if wantSession {
+            // Never during a Retry-After, a backoff or a refused key: the
+            // next ordinary session carries the identify instead.
+            if wantSession && core.mayOpenSessionNow(nowMs: now()) {
                 core.markSessionWanted()
                 pump()
             }
@@ -1245,7 +1259,14 @@ public final class RavensightClient: @unchecked Sendable {
             return
         }
         let error = response.errorCode(fallback: fallbackCode(response.status))
-        let outcome = RavensightIdentity.outcome(status: response.status, error: error)
+        var outcome = RavensightIdentity.outcome(status: response.status, error: error)
+        if response.status == 400 && error == "no_session" {
+            // Identify again after the next session opens, once.
+            noSessionStreak += 1
+            if noSessionStreak >= 2 { outcome = .stopForLaunch }
+        } else {
+            noSessionStreak = 0
+        }
         if outcome == .stopForLaunch { identifyStopped = true }
         identityLock.unlock()
         switch outcome {

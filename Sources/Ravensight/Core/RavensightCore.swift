@@ -579,6 +579,12 @@ struct RavensightCore {
         if isActive { sessionWanted = true }
     }
 
+    /// False while a Retry-After, a backoff or a refused key holds sending,
+    /// so nothing outside the queue opens a session then.
+    func mayOpenSessionNow(nowMs: Int64) -> Bool {
+        return !keyRefused && nowMs >= retryAfterUntilMs && nowMs >= nextAttemptAtMs
+    }
+
     /// Drop the current session so the next step opens a fresh one.
     mutating func invalidateSession() {
         sessionGeneration += 1
