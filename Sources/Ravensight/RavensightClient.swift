@@ -179,6 +179,8 @@ public final class RavensightClient: @unchecked Sendable {
     private var identifiedSession: String?
     /// no_session answers in a row: a second one ends identify for the launch.
     private var noSessionStreak = 0
+    /// Two no_session answers in a row: stopped until resetIdentity.
+    private var noSessionStopped = false
     /// Bumped by resetIdentity and opt-out: an answer from before is stale.
     private var identityGeneration = 0
 
@@ -1175,6 +1177,7 @@ public final class RavensightClient: @unchecked Sendable {
         heldAccountId = nil
         identifiedSession = nil
         noSessionStreak = 0
+        noSessionStopped = false
         identityGeneration += 1
         identityLock.unlock()
         // Deleted even while inert: an identity an earlier keyed build saved
@@ -1221,7 +1224,7 @@ public final class RavensightClient: @unchecked Sendable {
             storeIdentity(StoredIdentity(salt: salt, accountHash: RavensightIdentity.accountHash(accountId: raw, salt: salt)))
             heldAccountId = nil
         }
-        guard !identifyStopped, !identifySaltMissing, identity != nil || heldAccountId != nil else {
+        guard !identifyStopped, !noSessionStopped, !identifySaltMissing, identity != nil || heldAccountId != nil else {
             identityLock.unlock()
             return
         }
@@ -1259,11 +1262,16 @@ public final class RavensightClient: @unchecked Sendable {
             return
         }
         let error = response.errorCode(fallback: fallbackCode(response.status))
-        var outcome = RavensightIdentity.outcome(status: response.status, error: error)
+        let outcome = RavensightIdentity.outcome(status: response.status, error: error)
         if response.status == 400 && error == "no_session" {
             // Identify again after the next session opens, once.
             noSessionStreak += 1
-            if noSessionStreak >= 2 { outcome = .stopForLaunch }
+            if noSessionStreak >= 2 {
+                noSessionStopped = true
+                identityLock.unlock()
+                log("identify answered no_session twice in a row; not sent again until a sign-out")
+                return
+            }
         } else {
             noSessionStreak = 0
         }

@@ -20,8 +20,9 @@ Needs a Ravensight server that offers identify (the session answer carries
   different account runs `resetIdentity()` first. `resetIdentity()` deletes
   the identity and switches to a fresh device id as `resetDeviceId()` does;
   `resetDeviceId()` alone keeps it. Opting out deletes it.
-- Answers: 200 is done for the session; 404, `invalid_account_hash` and a
-  second `no_session` in a row stop identify for the launch; every other
+- Answers: 200 is done for the session; 404 and `invalid_account_hash` stop
+  identify for the launch, and a second `no_session` in a row stops it until
+  `resetIdentity()`; every other
   answer, offline included, waits for the next session. No retry loop.
   Identify never enters the event queue or the queue file, never opens a
   session while a Retry-After or backoff holds sending, and never becomes the
