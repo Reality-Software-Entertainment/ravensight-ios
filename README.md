@@ -1090,3 +1090,7 @@ client.setAttribution(RavensightAttribution(source: "store_referrer", campaign: 
 
 The server must know the `rs_ad_` and `rs_attr_` keys before a public key
 accepts them: use these helpers only with a server release that has them.
+
+## Contributing
+
+Install the local checks once per clone: `git config core.hooksPath .githooks`. The pre-push hook then runs this repository's tests before every push, with a time limit, and refuses the push if they fail. CI runs nightly and on demand, not on pushes or pull requests, so this hook is where a change is checked first.
