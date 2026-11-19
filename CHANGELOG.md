@@ -30,6 +30,14 @@ Needs a Ravensight server that offers identify (the session answer carries
 - Called before this launch's salt is known, the id is held and hashed under
   the salt the session answer brings, even when it matches the stored
   identity; the last call before the salt wins.
+- `Ravensight.setCampaignLink(_:)` (also on `RavensightClient`): pass the
+  `rs_link` id of the universal link or deep link that brought the player.
+  A link id (24 hex characters, any case) is sent lower case, once, as
+  `campaignLink` on the next `POST /session`, and kept for the next attempt
+  until a session opens; anything else returns `false` and changes nothing.
+  Memory only, held before `start`, never sent by a playtest run, and under
+  the same key and consent rules as everything else. A server that does not
+  know the field ignores it.
 
 ## [0.6.0] - 2026-11-06
 

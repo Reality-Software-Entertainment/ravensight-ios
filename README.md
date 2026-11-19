@@ -138,6 +138,7 @@ Everything game code needs is static on `Ravensight`:
 | `Ravensight.stopAllTelemetry()` / `resumeTelemetry()` | Stops everything now, synthetic sessions included, and saves nothing. |
 | `Ravensight.resetDeviceId()` | Saves a new durable identity and returns it. Never returns a synthetic id. |
 | `Ravensight.identify(_:)` / `resetIdentity()` / `isIdentified` | Links this device to your game's own account after sign-in, and forgets it on sign-out. See "Identify players who sign in". |
+| `Ravensight.setCampaignLink(_:)` | Passes the `rs_link` id of the universal link or deep link that brought the player. Returns false for anything but a link id. Works before `start`. See "Campaign links". |
 | `Ravensight.deviceId` | The durable device id, safe to mirror. Never a synthetic id. |
 | `Ravensight.playtestDeviceId` / `isSynthetic` | The id a synthetic (playtest) run sends, and whether this run is one. |
 | `Ravensight.stats` | `queued`, `delivered`, `pending`, `droppedEvents`, `restored`, `lastDelivery`. |
@@ -341,6 +342,59 @@ Ravensight.resetIdentity()        // on sign-out
 Your privacy form: a game that calls `identify` links Ravensight data to the
 player's account, so declare the data types as linked to the player (and a
 User ID) in your own manifest.
+
+## Campaign links
+
+A Ravensight campaign link (`https://go.ravensight.io/...`) that points at
+your own https page adds `rs_link=<link id>` to the address it redirects to.
+When that page opens your app as a universal link, pass the `rs_link` value
+to the SDK. The player and the session are then counted on the Campaign
+links page, by link, and the players it brought open in Player insights.
+
+```swift
+import Ravensight
+
+/// The rs_link value of the link that opened the app, or nil.
+func campaignLink(in url: URL) -> String? {
+    return URLComponents(url: url, resolvingAgainstBaseURL: false)?
+        .queryItems?.first { $0.name == "rs_link" }?.value
+}
+
+// SwiftUI: universal links arrive here.
+WindowGroup {
+    ContentView()
+        .onOpenURL { url in Ravensight.setCampaignLink(campaignLink(in: url)) }
+}
+
+// UIKit, in your scene delegate.
+func scene(_ scene: UIScene, continue userActivity: NSUserActivity) {
+    if let url = userActivity.webpageURL { Ravensight.setCampaignLink(campaignLink(in: url)) }
+}
+```
+
+A UIKit app opened from a cold start by the link gets it in
+`scene(_:willConnectTo:options:)`, in `connectionOptions.userActivities`;
+pass it on the same way. If your app already resolves the link id another
+way, such as a deferred deep link or an install referrer it reads, pass that
+value instead.
+
+- **Once.** The id goes as `campaignLink` with the next session the SDK
+  opens, so call it as soon as your link handler runs. Before `start` is
+  fine: the id is held for this process and goes with the first session. A
+  session that fails to open keeps it for the next attempt; later sessions
+  do not send it unless you call again.
+- **Only a link id.** `setCampaignLink` returns false and changes nothing
+  for anything but 24 hex characters. A valid call replaces one still
+  waiting. The server keeps it only when it names a link of the same game,
+  and never refuses or slows a session because of it.
+- **Nothing stored.** The id is held in memory only, never saved. It is one
+  you created, not personal data, and nothing else from the address is read.
+- **Same rules.** Without a key nothing is sent. With `consent = .optIn` it
+  waits and goes with the first session after the player's yes. An opted
+  out or stopped player sends nothing, and a synthetic (playtest) run never
+  sends it.
+
+Needs SDK 0.7.0 or later.
 
 ## Telling players
 
@@ -974,7 +1028,9 @@ launch marker, background launches and playtest runs),
 the persisted queue in a temporary directory and the delivery counters,
 `RavensightPublicBuildTests` covers the public build rules (inert without
 a key, opt-in before and after the yes, distribution, a refused key, jitter
-bounds, `rs_event_id` shape and persistence, the 8 KB cap), and
+bounds, `rs_event_id` shape and persistence, the 8 KB cap),
+`RavensightCampaignLinkTests` covers the campaign link (sent once, kept
+after a failed session, consent, playtest runs, nothing saved), and
 `RavensightReportTests` checks every Player Reports request shape and
 refusal against a stub transport. To run the same suite on the iOS
 Simulator:
@@ -1002,7 +1058,9 @@ the session (turn them off with `sendDeviceInfo = false`):
 | `device.osVersion` | the OS version only, such as `17.4.1` | `ProcessInfo.operatingSystemVersion` |
 
 No GPU name is sent. Country is never sent by the SDK. Each value is
-trimmed, kept to printable characters and cut to 128 characters. These are
+trimmed, kept to printable characters and cut to 128 characters. When you
+call `setCampaignLink`, one session also carries that link id (see
+"Campaign links"); it is never saved. These are
 device information, not a device identifier, so the privacy manifest needs
 no new category; check this against Apple's categories before release.
 
