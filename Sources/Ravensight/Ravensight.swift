@@ -63,10 +63,12 @@ public enum Ravensight {
         pendingEnabled = nil
         let client = makeClient(configuration)
         _shared = client
-        let link = pendingCampaignLink
+        // Queued before the lock is released, so a setCampaignLink(_:) made on
+        // another thread right after start() reaches the client after the
+        // link held from before start, and the later call wins.
+        if let link = pendingCampaignLink { client.setCampaignLink(link) }
         pendingCampaignLink = nil
         lock.unlock()
-        if let link = link { client.setCampaignLink(link) }
         client.start()
         return client
     }
