@@ -18,6 +18,11 @@ final class FakeTransport: RavensightTransport {
     var batchError: String?
     /// Sent as the session answer's signing object when set.
     var signing: [String: Any]?
+    /// Sent as the session answer's identify.salt when set.
+    var identifySalt: String?
+    /// The answer to POST /identify.
+    var identifyStatus = 200
+    var identifyError: String?
     /// Requests whose completion is never called (a hung network).
     var hang = false
     /// Answers a request before the scripted routes, when it returns one.
@@ -131,6 +136,7 @@ final class FakeTransport: RavensightTransport {
                 ]
                 lock.lock()
                 if let signing = signing { answer["signing"] = signing }
+                if let salt = identifySalt { answer["identify"] = ["salt": salt] }
                 lock.unlock()
                 completion(RavensightResponse(status: 201, body: json(answer)))
             } else {
@@ -141,6 +147,18 @@ final class FakeTransport: RavensightTransport {
                 status: batchStatus,
                 body: batchError.flatMap { json(["error": $0]) }
             ))
+        } else if request.url.hasSuffix("/identify") {
+            lock.lock()
+            let status = identifyStatus
+            let error = identifyError
+            lock.unlock()
+            if status == 200 {
+                completion(RavensightResponse(status: 200, body: json(["playerId": "px_test", "linked": true, "verified": false, "repeat": false])))
+            } else {
+                var body: [String: Any] = ["error": error ?? "http_\(status)"]
+                if error == "quota_exceeded" { body["reason"] = "needs_funds" }
+                completion(RavensightResponse(status: status, body: json(body)))
+            }
         } else if request.url.hasSuffix("/feedback") {
             completion(RavensightResponse(status: 201))
         } else if request.url.hasSuffix("/agent/suggestions") {
