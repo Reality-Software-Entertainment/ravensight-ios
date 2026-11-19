@@ -490,6 +490,183 @@ final class RavensightIdentifyTests: XCTestCase {
         XCTAssertNil(stored)
     }
 
+    // MARK: Flow review fixes
+
+    private func hmac(_ id: String, _ salt: String) -> String {
+        return RavensightIdentity.accountHash(accountId: id, salt: salt)
+    }
+
+    /// F1: no eager session open while a Retry-After holds gameplay events.
+    func testNoEagerSessionDuringARetryAfterHold() {
+        let transport = saltedTransport(prefix: "s")
+        transport.override = { request in
+            request.url.hasSuffix("/track/batch") ? RavensightResponse(status: 429, body: Data(#"{"error":"rate_limited"}"#.utf8), retryAfter: "120") : nil
+        }
+        let client = makeClient(transport: transport)
+        client.start()
+        client.track("a")
+        flushAndWait(client)
+        XCTAssertEqual(transport.requests(suffix: "/session").count, 1)
+        client.resetDeviceId() // the session is gone; the hold is not
+        client.identify("u1")
+        settle(client)
+        var wanted = true
+        let read = expectation(description: "core")
+        client.onWorkQueue { wanted = client.core.sessionWanted; read.fulfill() }
+        wait(for: [read], timeout: 2)
+        XCTAssertFalse(wanted)
+        XCTAssertEqual(transport.requests(suffix: "/session").count, 1)
+        XCTAssertTrue(identifies(transport).isEmpty)
+        // The next ordinary session carries it.
+        transport.override = nil
+        clock.advance(seconds: 121)
+        client.track("b")
+        flushAndWait(client)
+        XCTAssertEqual(identifies(transport).map { $0.session }, ["s_2"])
+    }
+
+    /// F2: the same id before the salt is known is held and hashed under the salt that arrives.
+    func testTheSameIdBeforeTheSaltIsHashedUnderTheNewSalt() {
+        let first = saltedTransport(prefix: "A")
+        var client = makeClient(transport: first)
+        client.start()
+        client.identify("u1")
+        settle(client)
+        XCTAssertEqual(stored?["salt"], salt)
+        let other = (vectors["salts_differ"] as? [String: String])?["salt_b"] ?? ""
+        let second = saltedTransport(prefix: "B", salt: other)
+        client = makeClient(transport: second)
+        XCTAssertTrue(client.identify("u1"))
+        client.start()
+        settle(client)
+        XCTAssertEqual(identifies(second).map { $0.hash }, [hmac("u1", other)])
+        XCTAssertEqual(stored, ["salt": other, "accountHash": hmac("u1", other)])
+    }
+
+    /// F3: consent back on inside an open session sends the identify.
+    func testCollectionBackOnInsideAnOpenSessionSendsTheIdentify() {
+        let transport = saltedTransport(prefix: "s")
+        let client = makeClient(transport: transport)
+        client.start()
+        client.track("a")
+        flushAndWait(client)
+        client.setEnabled(false)
+        XCTAssertTrue(client.identify("u1"))
+        settle(client)
+        XCTAssertTrue(identifies(transport).isEmpty)
+        client.setEnabled(true)
+        settle(client)
+        XCTAssertEqual(identifies(transport).map { $0.session }, ["s_1"])
+
+        client.setTrackingEnabled(false)
+        XCTAssertTrue(client.identify("u2"))
+        settle(client)
+        client.setTrackingEnabled(true)
+        settle(client)
+        XCTAssertEqual(identifies(transport).last?.hash, hmac("u2", salt))
+    }
+
+    private func seedIdentity() {
+        defaults.set(["salt": salt, "accountHash": hmac("u1", salt)], forKey: RavensightClient.identityKey)
+        defaults.set("dev_" + String(repeating: "a", count: 32), forKey: RavensightClient.deviceIdKey)
+    }
+
+    /// F4: before consent, a stored identity is deleted by a decline and by resetIdentity.
+    func testBeforeConsentAStoredIdentityIsDeletedByDeclineAndReset() {
+        seedIdentity()
+        var client = makeClient(transport: saltedTransport(prefix: "s"), ingestKey: "gt_pub_test") { $0.consent = .optIn }
+        client.setTrackingEnabled(false)
+        XCTAssertNil(stored)
+
+        seedIdentity()
+        let transport = saltedTransport(prefix: "t")
+        client = makeClient(transport: transport, ingestKey: "gt_pub_test") { $0.consent = .optIn }
+        client.start()
+        XCTAssertTrue(client.isIdentified)
+        client.resetIdentity()
+        settle(client)
+        XCTAssertNil(stored)
+        XCTAssertNotEqual(defaults.string(forKey: RavensightClient.deviceIdKey), "dev_" + String(repeating: "a", count: 32))
+        client.setTrackingEnabled(true)
+        client.track("a")
+        flushAndWait(client)
+        XCTAssertTrue(identifies(transport).isEmpty)
+    }
+
+    /// F4: a keyless build still deletes a stored identity on opt-out.
+    func testInertOptOutDeletesAStoredIdentity() {
+        seedIdentity()
+        let client = makeClient(transport: saltedTransport(prefix: "s"), ingestKey: "")
+        client.setTrackingEnabled(false)
+        XCTAssertNil(stored)
+    }
+
+    /// F6: two quick calls before the salt: the last one wins.
+    func testTheLastCallBeforeTheSaltWins() {
+        let transport = saltedTransport(prefix: "s")
+        let client = makeClient(transport: transport)
+        client.identify("u1")
+        client.identify("u2")
+        client.start()
+        settle(client)
+        XCTAssertEqual(identifies(transport).map { $0.hash }, [hmac("u2", salt)])
+        XCTAssertEqual(stored?["accountHash"], hmac("u2", salt))
+    }
+
+    /// F7: sent on the token the session answer just returned, whatever the device clock says.
+    func testSentOnTheFreshTokenEvenIfTheDeviceClockSaysItExpired() {
+        let transport = saltedTransport(prefix: "s")
+        let past = clock.nowMs / 1000 - 10
+        transport.override = { [salt] request in
+            guard request.url.hasSuffix("/session") else { return nil }
+            let body: [String: Any] = ["token": "fresh", "expiresAt": past, "identify": ["salt": salt]]
+            return RavensightResponse(status: 201, body: try? JSONSerialization.data(withJSONObject: body))
+        }
+        let client = makeClient(transport: transport)
+        client.identify("u1")
+        client.start()
+        settle(client)
+        XCTAssertEqual(identifies(transport).map { $0.session }, ["fresh"])
+    }
+
+    /// F8: a second no_session in a row ends identify for the launch; anything else resets the count.
+    func testASecondNoSessionInARowStopsAndOtherAnswersReset() {
+        let transport = saltedTransport(prefix: "s")
+        transport.identifyStatus = 400
+        transport.identifyError = "no_session"
+        let client = makeClient(transport: transport)
+        client.start()
+        client.identify("u1")
+        settle(client)
+        func nextSession() {
+            client.resetDeviceId()
+            client.track("x")
+            flushAndWait(client)
+        }
+        nextSession() // retried once
+        XCTAssertEqual(identifies(transport).count, 2)
+        nextSession() // two in a row: stopped
+        XCTAssertEqual(identifies(transport).count, 2)
+
+        let other = saltedTransport(prefix: "t")
+        other.identifyStatus = 400
+        other.identifyError = "no_session"
+        let second = makeClient(transport: other)
+        second.start()
+        second.identify("u2")
+        settle(second)
+        other.identifyStatus = 503
+        other.identifyError = "unavailable"
+        second.resetDeviceId(); second.track("x"); flushAndWait(second)
+        other.identifyStatus = 400
+        other.identifyError = "no_session"
+        second.resetDeviceId(); second.track("x"); flushAndWait(second)
+        second.resetDeviceId(); second.track("x"); flushAndWait(second)
+        XCTAssertEqual(identifies(other).count, 4)
+        // Identify answers never become the delivery record.
+        XCTAssertNotEqual(second.lastDelivery.map { "\($0.result)" }, "failed(status: 400)")
+    }
+
     // MARK: Facade
 
     func testFacadeBeforeStartAndAfter() {
