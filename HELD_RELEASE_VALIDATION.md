@@ -23,3 +23,16 @@ Experiment keys and variant labels may use those words as string values, matchin
 the server contract. Regression coverage distinguishes those cases. Publishing remains held.
 
 Player Reports identity audit: full `swift test` passes 181 tests, including 12 report tests. A new regression resets identity during screenshot storage upload and verifies no finalization using the old session. Report async boundaries now stop when the session changes. macOS Swift validation does not exercise UIKit capture on an iOS device or live object storage. Publishing remains held.
+
+## 0.7.0: identify players who sign in, and campaign links (November 21, 2026)
+
+- Identify (`identify`, `resetIdentity`, `isIdentified`) and `setCampaignLink`
+  together on main at 5ba1c6c, built to the platform's identify contract
+  version 2 and the campaign link rules of the JavaScript SDK 0.12.0.
+- `swift build` and `swift test` on macOS (Swift 6.4.2): **310 tests**, 0
+  failures. `Examples/NarrativeSample`: 8 tests, 0 failures.
+- The identify tests read the contract's binding vectors from
+  `Tests/RavensightTests/Fixtures/identify-vectors.json`, byte for byte the
+  platform's copy.
+- Requests went through a fake transport: no live service, simulator or
+  device was used.

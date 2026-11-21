@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.7.0] - 2026-11-19
+## [0.7.0] - 2026-11-21
 
 Needs a Ravensight server that offers identify (the session answer carries
 `identify.salt`). Against an older server identify does nothing.
