@@ -246,10 +246,19 @@ struct RavensightCore {
     /// Queued events carried by the batch request in flight (noteInFlight).
     private(set) var inFlightCount = 0
     private(set) var sessionToken: String?
+    /// The identify salt the last session answer carried (identify.salt),
+    /// nil when it carried none.
+    private(set) var identifySalt: String?
     /// Unix milliseconds.
     private(set) var sessionExpiresAtMs: Int64 = 0
     /// Set when something other than the queue needs a session (feedback).
     private(set) var sessionWanted = false
+    /// The campaign link waiting for the next session this client opens for
+    /// its own player (setCampaignLink), lower case. Memory only, never saved.
+    private(set) var campaignLink: String?
+    /// The campaign link the session request in flight carried
+    /// (noteSessionInFlight), nil when it carried none.
+    private(set) var campaignLinkInFlight: String?
 
     private(set) var pendingEvents: [RavensightEvent] = [] {
         didSet { queueRevision &+= 1 }
@@ -480,6 +489,48 @@ struct RavensightCore {
         inFlightCount = count
     }
 
+    // MARK: Campaign link
+
+    /// A campaign link id: exactly 24 hex characters in any case, returned
+    /// lower case. Anything else (nil, empty, another length, a space, a
+    /// character that is not hex) is nil.
+    static func validCampaignLink(_ id: String?) -> String? {
+        guard let id = id else { return nil }
+        let bytes = Array(id.utf8)
+        guard bytes.count == 24 else { return nil }
+        let hex = bytes.allSatisfy { byte in
+            (byte >= 0x30 && byte <= 0x39) || (byte >= 0x41 && byte <= 0x46) || (byte >= 0x61 && byte <= 0x66)
+        }
+        return hex ? id.lowercased() : nil
+    }
+
+    /// Makes a valid link id the pending one, replacing any earlier one, and
+    /// returns true. An invalid id returns false and changes nothing.
+    @discardableResult
+    mutating func setCampaignLink(_ id: String?) -> Bool {
+        guard let link = RavensightCore.validCampaignLink(id) else { return false }
+        campaignLink = link
+        return true
+    }
+
+    /// Called by the driver as the session request nextStep built leaves:
+    /// remembers the link that request carried, so its answer drops that
+    /// link and not one set while it was out.
+    mutating func noteSessionInFlight() {
+        campaignLinkInFlight = config.playtestToken == nil ? campaignLink : nil
+    }
+
+    /// A session answer arrived, current or stale. A 201 with a token
+    /// delivered the link its request carried: it is dropped, unless a
+    /// different one was set since. Any other answer keeps it for the next
+    /// attempt.
+    mutating func settleCampaignLink(_ response: RavensightResponse) {
+        defer { campaignLinkInFlight = nil }
+        guard let sent = campaignLinkInFlight, response.status == 201,
+              let token = (response.json as? [String: Any])?["token"] as? String, !token.isEmpty else { return }
+        if campaignLink == sent { campaignLink = nil }
+    }
+
     /// A typed config read: every assigned experiment not yet exposed this
     /// run becomes exposed, and one rs_exposure event carrying their tags is
     /// queued. Returns true when it queued one.
@@ -574,6 +625,12 @@ struct RavensightCore {
     /// (used by feedback, which needs a session token).
     mutating func markSessionWanted() {
         if isActive { sessionWanted = true }
+    }
+
+    /// False while a Retry-After, a backoff or a refused key holds sending,
+    /// so nothing outside the queue opens a session then.
+    func mayOpenSessionNow(nowMs: Int64) -> Bool {
+        return !keyRefused && nowMs >= retryAfterUntilMs && nowMs >= nextAttemptAtMs
     }
 
     /// Drop the current session so the next step opens a fresh one.
@@ -715,6 +772,7 @@ struct RavensightCore {
     }
 
     private mutating func handleSession(_ response: RavensightResponse, nowMs: Int64) -> [Effect] {
+        settleCampaignLink(response)
         let parsed = response.json as? [String: Any]
         let token = parsed?["token"] as? String
 
@@ -722,6 +780,7 @@ struct RavensightCore {
             sessionToken = token
             sessionExpiresAtMs = RavensightCore.resolveExpiryMs(parsed, nowMs: nowMs)
             readErrorCapture(parsed)
+            identifySalt = RavensightIdentity.salt(in: parsed)
             // The origin, kept exactly as received: events tracked under this
             // session carry it, so a later launch sends them as this session's.
             sessionOrigin = parsed?["origin"] as? [String: Any]
@@ -967,6 +1026,8 @@ struct RavensightCore {
         ]
         if let distribution = config.distribution { body["distribution"] = distribution }
         if !config.device.isEmpty { body["device"] = config.device }
+        // The player's own sessions only, never a playtest run's.
+        if config.playtestToken == nil, let link = campaignLink { body["campaignLink"] = link }
         return RavensightRequest(
             method: "POST",
             url: config.apiUrl + "/session",
@@ -1042,6 +1103,20 @@ struct RavensightCore {
             url: config.apiUrl + "/reports" + path,
             headers: withPlaytest(headers),
             body: body.map { RavensightCore.encodeJSON($0) }
+        )
+    }
+
+    /// POST /identify: the key, the session token and only the hash.
+    func identifyRequest(accountHash: String, token: String) -> RavensightRequest {
+        return RavensightRequest(
+            method: "POST",
+            url: config.apiUrl + "/identify",
+            headers: withPlaytest([
+                "Content-Type": "application/json",
+                "X-API-Key": config.ingestKey,
+                "X-Session-Token": token,
+            ]),
+            body: RavensightCore.encodeJSON(["accountHash": accountHash])
         )
     }
 

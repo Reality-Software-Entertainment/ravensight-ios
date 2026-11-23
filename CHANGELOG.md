@@ -1,5 +1,44 @@
 # Changelog
 
+## [0.7.0] - 2026-11-21
+
+Needs a Ravensight server that offers identify (the session answer carries
+`identify.salt`). Against an older server identify does nothing.
+
+### Added
+
+- `Ravensight.identify(_:)`, `Ravensight.resetIdentity()` and
+  `Ravensight.isIdentified` (also on `RavensightClient`), for games with
+  their own sign-in. The id is checked on the device (not empty, at most
+  256 UTF-8 bytes, no `@`, never trimmed) and refused with `false` and one
+  console line. Only an HMAC-SHA256 of the id, keyed with the game's salt
+  from the session answer, is sent to `POST /api/v1/identify`, once per
+  session, with the key and the session token. The raw id is held in memory
+  until the salt is known and is never saved: `ravensight_identity` holds
+  `{ salt, accountHash }`.
+- A stored identity made under another salt is deleted, never sent. A
+  different account runs `resetIdentity()` first. `resetIdentity()` deletes
+  the identity and switches to a fresh device id as `resetDeviceId()` does;
+  `resetDeviceId()` alone keeps it. Opting out deletes it.
+- Answers: 200 is done for the session; 404 and `invalid_account_hash` stop
+  identify for the launch, and a second `no_session` in a row stops it until
+  `resetIdentity()`; every other
+  answer, offline included, waits for the next session. No retry loop.
+  Identify never enters the event queue or the queue file, never opens a
+  session while a Retry-After or backoff holds sending, and never becomes the
+  delivery record.
+- Called before this launch's salt is known, the id is held and hashed under
+  the salt the session answer brings, even when it matches the stored
+  identity; the last call before the salt wins.
+- `Ravensight.setCampaignLink(_:)` (also on `RavensightClient`): pass the
+  `rs_link` id of the universal link or deep link that brought the player.
+  A link id (24 hex characters, any case) is sent lower case, once, as
+  `campaignLink` on the next `POST /session`, and kept for the next attempt
+  until a session opens; anything else returns `false` and changes nothing.
+  Memory only, held before `start`, never sent by a playtest run, and under
+  the same key and consent rules as everything else. A server that does not
+  know the field ignores it.
+
 ## [0.6.0] - 2026-11-06
 
 Implements the Ravensight delivery, ads and attribution, exposure and
